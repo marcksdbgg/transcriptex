@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from yt_channel_transcriber.fs_utils import (
+from transcriptex.fs_utils import (
     extract_video_id_from_stem,
     normalize_list_arg,
     now_utc_iso,

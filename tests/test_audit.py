@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from yt_channel_transcriber.audit import AuditConfig, audit_channel_output
+from transcriptex.audit import AuditConfig, audit_channel_output
 
 
 class AuditTests(unittest.TestCase):

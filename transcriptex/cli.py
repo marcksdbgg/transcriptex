@@ -4,10 +4,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from yt_channel_transcriber.audit import AuditConfig, audit_channel_output
-from yt_channel_transcriber.fs_utils import normalize_list_arg
-from yt_channel_transcriber.search import SearchConfig, parse_comma_int_list, search_channel_output
-from yt_channel_transcriber.transcriber import DEFAULT_TABS, ChannelTranscriber, TranscriberConfig
+from transcriptex.audit import AuditConfig, audit_channel_output
+from transcriptex.fs_utils import normalize_list_arg
+from transcriptex.search import SearchConfig, parse_comma_int_list, search_channel_output
+from transcriptex.transcriber import DEFAULT_TABS, ChannelTranscriber, TranscriberConfig
 
 RUN_COMMAND = "run"
 AUDIT_COMMAND = "audit"
@@ -20,7 +20,7 @@ KNOWN_SUBCOMMANDS = {RUN_COMMAND, AUDIT_COMMAND, SEARCH_COMMAND, ASR_COMMAND, TR
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="yt-channel-transcriber",
+        prog="transcriptex",
         description="YouTube channel transcript CLI (run + audit + search).",
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -295,6 +295,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.stdout.encoding.lower() != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
+
     argv = list(argv if argv is not None else sys.argv[1:])
     argv = _normalize_argv_for_backward_compat(argv)
 
@@ -409,7 +415,7 @@ def _run_search(args: argparse.Namespace) -> int:
 
 
 def _run_asr(args: argparse.Namespace) -> int:
-    from yt_channel_transcriber.asr import AsrConfig, run_asr
+    from transcriptex.asr import AsrConfig, run_asr
 
     config = AsrConfig(
         channel_dir=Path(args.channel_dir),
@@ -435,7 +441,7 @@ def _run_asr(args: argparse.Namespace) -> int:
 
 
 def _run_transcribe_single(args: argparse.Namespace) -> int:
-    from yt_channel_transcriber.transcribe_single import TranscribeSingleConfig, run_transcribe_single
+    from transcriptex.transcribe_single import TranscribeSingleConfig, run_transcribe_single
 
     config = TranscribeSingleConfig(
         input_path=args.input_path,
@@ -458,7 +464,7 @@ def _run_transcribe_single(args: argparse.Namespace) -> int:
 
 
 def _run_realtime(args: argparse.Namespace) -> int:
-    from yt_channel_transcriber.realtime import RealtimeConfig, run_realtime
+    from transcriptex.realtime import RealtimeConfig, run_realtime
 
     config = RealtimeConfig(
         model=args.model,

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from yt_channel_transcriber.youtube_client import download_single_audio
+from transcriptex.youtube_client import download_single_audio
 
 
 @dataclass

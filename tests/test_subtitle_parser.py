@@ -1,6 +1,6 @@
 import unittest
 
-from yt_channel_transcriber.subtitle_parser import (
+from transcriptex.subtitle_parser import (
     parse_json3,
     parse_subtitle_bytes,
     parse_vtt_or_srt,

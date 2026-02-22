@@ -1,5 +1,5 @@
 """
-test_asr.py — Unit tests for yt_channel_transcriber.asr module.
+test_asr.py — Unit tests for transcriptex.asr module.
 
 All tests use mocks for faster-whisper and yt-dlp to avoid real GPU/network calls.
 Pattern follows existing tests (tempfile.TemporaryDirectory, csv.DictWriter, unittest).
@@ -12,12 +12,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from yt_channel_transcriber.asr import (
+from transcriptex.asr import (
     AsrConfig,
     _write_asr_transcript,
     run_asr,
 )
-from yt_channel_transcriber.cli import build_parser
+from transcriptex.cli import build_parser
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +151,8 @@ class AsrRunTests(unittest.TestCase):
         _write_index(meta_dir, rows)
         return channel_dir
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_writes_transcript_and_updates_index(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
@@ -194,8 +194,8 @@ class AsrRunTests(unittest.TestCase):
             self.assertEqual(row["error"], "")
             self.assertNotEqual(row["transcript_path"], "")
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_skips_existing_transcript_without_force(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
@@ -218,8 +218,8 @@ class AsrRunTests(unittest.TestCase):
             self.assertEqual(report["skipped"], 1)
             self.assertEqual(report["ok"], 0)
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_force_overwrites_existing(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
@@ -245,8 +245,8 @@ class AsrRunTests(unittest.TestCase):
             content = existing.read_text(encoding="utf-8")
             self.assertIn("Nuevo contenido.", content)
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_skips_non_eligible_statuses(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
@@ -271,8 +271,8 @@ class AsrRunTests(unittest.TestCase):
             self.assertEqual(report["total_processed"], 1)
             self.assertEqual(mock_download.call_count, 1)
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_limit_respected(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
@@ -295,8 +295,8 @@ class AsrRunTests(unittest.TestCase):
             self.assertEqual(report["total_processed"], 2)
             self.assertEqual(mock_download.call_count, 2)
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_include_failed_processes_failed_videos(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
@@ -321,8 +321,8 @@ class AsrRunTests(unittest.TestCase):
             self.assertEqual(report["total_processed"], 2)
             self.assertEqual(mock_download.call_count, 2)
 
-    @patch("yt_channel_transcriber.asr._load_model")
-    @patch("yt_channel_transcriber.asr._download_audio")
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
     def test_asr_download_error_recorded_in_report(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:

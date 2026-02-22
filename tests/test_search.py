@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from yt_channel_transcriber.search import SearchConfig, search_channel_output
+from transcriptex.search import SearchConfig, search_channel_output
 
 
 class SearchTests(unittest.TestCase):

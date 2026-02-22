@@ -20,7 +20,7 @@ from typing import Any
 # FIX: Disable symlinks on Windows to avoid [WinError 1314] if not Admin/DevMode
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
-from yt_channel_transcriber.fs_utils import (
+from transcriptex.fs_utils import (
     build_transcript_filename,
     ensure_dir,
     extract_video_id_from_stem,
@@ -131,7 +131,7 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
     if not video_index_path.exists():
         raise FileNotFoundError(
             f"video_index.csv not found in: {meta_dir}\n"
-            "Run 'yt-channel-transcriber run <url>' first."
+            "Run 'transcriptex run <url>' first."
         )
 
     rows = _read_video_index(video_index_path)

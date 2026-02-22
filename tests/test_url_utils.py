@@ -1,6 +1,6 @@
 import unittest
 
-from yt_channel_transcriber.url_utils import extract_video_id, normalize_channel_url
+from transcriptex.url_utils import extract_video_id, normalize_channel_url
 
 
 class UrlUtilsTests(unittest.TestCase):

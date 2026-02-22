@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from yt_channel_transcriber.fs_utils import (
+from transcriptex.fs_utils import (
     build_transcript_filename,
     extract_video_id_from_stem,
     now_utc_iso,

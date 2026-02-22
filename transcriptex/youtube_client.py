@@ -6,8 +6,8 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from yt_channel_transcriber.models import ChannelInfo, PlaylistRecord, VideoRecord
-from yt_channel_transcriber.url_utils import (
+from transcriptex.models import ChannelInfo, PlaylistRecord, VideoRecord
+from transcriptex.url_utils import (
     channel_tab_url,
     extract_playlist_id,
     extract_video_id,

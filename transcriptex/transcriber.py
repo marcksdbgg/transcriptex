@@ -8,17 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from yt_channel_transcriber.fs_utils import (
+from transcriptex.fs_utils import (
     build_transcript_filename,
     ensure_dir,
     extract_video_id_from_stem,
     now_utc_iso,
     sanitize_name,
 )
-from yt_channel_transcriber.models import PlaylistRecord, SubtitleTrack, TranscriptResult, VideoRecord
-from yt_channel_transcriber.subtitle_parser import parse_subtitle_bytes
-from yt_channel_transcriber.url_utils import normalize_channel_url, video_url_from_id
-from yt_channel_transcriber.youtube_client import YouTubeClient, infer_subtitle_ext
+from transcriptex.models import PlaylistRecord, SubtitleTrack, TranscriptResult, VideoRecord
+from transcriptex.subtitle_parser import parse_subtitle_bytes
+from transcriptex.url_utils import normalize_channel_url, video_url_from_id
+from transcriptex.youtube_client import YouTubeClient, infer_subtitle_ext
 
 DEFAULT_TABS = ("videos", "shorts", "streams")
 UNGROUPED_FOLDER = "Sin_Playlist"

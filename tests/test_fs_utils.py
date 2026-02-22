@@ -1,6 +1,6 @@
 import unittest
 
-from yt_channel_transcriber.fs_utils import build_transcript_filename, extract_video_id_from_stem
+from transcriptex.fs_utils import build_transcript_filename, extract_video_id_from_stem
 
 
 class FsUtilsTests(unittest.TestCase):
