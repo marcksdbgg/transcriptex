@@ -13,7 +13,9 @@ RUN_COMMAND = "run"
 AUDIT_COMMAND = "audit"
 SEARCH_COMMAND = "search"
 ASR_COMMAND = "asr"
-KNOWN_SUBCOMMANDS = {RUN_COMMAND, AUDIT_COMMAND, SEARCH_COMMAND, ASR_COMMAND}
+TRANSCRIBE_COMMAND = "transcribe"
+REALTIME_COMMAND = "realtime"
+KNOWN_SUBCOMMANDS = {RUN_COMMAND, AUDIT_COMMAND, SEARCH_COMMAND, ASR_COMMAND, TRANSCRIBE_COMMAND, REALTIME_COMMAND}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -261,6 +263,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose yt-dlp output during audio download",
     )
+
+    transcribe_parser = subparsers.add_parser(
+        TRANSCRIBE_COMMAND,
+        help="Transcribe a single local audio/video file or YouTube URL",
+        description="Download audio if URL, then transcribe using local faster-whisper.",
+    )
+    transcribe_parser.add_argument("input_path", help="Local file path or YouTube URL")
+    transcribe_parser.add_argument("-o", "--output", default=".", help="Output directory (default: current)")
+    transcribe_parser.add_argument("--format", default="srt", choices=["txt", "json", "srt", "vtt"], help="Output format (default: srt)")
+    transcribe_parser.add_argument("--model", default="large-v3-turbo", help="Whisper model name (default: large-v3-turbo)")
+    transcribe_parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Inference device (default: cuda)")
+    transcribe_parser.add_argument("--compute-type", default="float16", help="Model quantization (default: float16)")
+    transcribe_parser.add_argument("--language", default="", help="Language code (default: auto)")
+    transcribe_parser.add_argument("--beam-size", type=int, default=5, help="Beam search size (default: 5)")
+    transcribe_parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+
+    realtime_parser = subparsers.add_parser(
+        REALTIME_COMMAND,
+        help="Live realtime transcription of system audio (Loopback WASAPI)",
+        description="Captures live audio playing on your PC (e.g., from a browser) and transcribes it to the console.",
+    )
+    realtime_parser.add_argument("--model", default="medium", help="Whisper model name (default: medium, for speed)")
+    realtime_parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Inference device (default: cuda)")
+    realtime_parser.add_argument("--compute-type", default="float16", help="Model quantization (default: float16)")
+    realtime_parser.add_argument("--language", default="", help="Language code (default: auto)")
+    realtime_parser.add_argument("--beam-size", type=int, default=1, help="Beam search size (default: 1 for latency)")
+    realtime_parser.add_argument("--chunk-duration", type=float, default=3.0, help="Audio buffer block duration in seconds (default: 3.0)")
+
     return parser
 
 
@@ -278,6 +308,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_search(args)
     if command == ASR_COMMAND:
         return _run_asr(args)
+    if command == TRANSCRIBE_COMMAND:
+        return _run_transcribe_single(args)
+    if command == REALTIME_COMMAND:
+        return _run_realtime(args)
     return _run_export(args)
 
 
@@ -398,6 +432,49 @@ def _run_asr(args: argparse.Namespace) -> int:
         return 1
 
     return 2 if report.get("errors", 0) > 0 else 0
+
+
+def _run_transcribe_single(args: argparse.Namespace) -> int:
+    from yt_channel_transcriber.transcribe_single import TranscribeSingleConfig, run_transcribe_single
+
+    config = TranscribeSingleConfig(
+        input_path=args.input_path,
+        output_dir=Path(args.output).resolve(),
+        output_format=args.format,
+        model=args.model,
+        device=args.device,
+        compute_type=args.compute_type,
+        language=args.language,
+        beam_size=max(1, int(args.beam_size)),
+        verbose=bool(args.verbose),
+    )
+    try:
+        report = run_transcribe_single(config)
+    except Exception as exc:
+        print(f"Fatal error: {exc}")
+        return 1
+
+    return 0 if report.get("success") else 1
+
+
+def _run_realtime(args: argparse.Namespace) -> int:
+    from yt_channel_transcriber.realtime import RealtimeConfig, run_realtime
+
+    config = RealtimeConfig(
+        model=args.model,
+        device=args.device,
+        compute_type=args.compute_type,
+        language=args.language,
+        beam_size=max(1, int(args.beam_size)),
+        chunk_duration=max(0.5, float(args.chunk_duration)),
+    )
+    try:
+        report = run_realtime(config)
+    except Exception as exc:
+        print(f"Fatal error: {exc}")
+        return 1
+
+    return 0 if report.get("success") else 1
 
 
 def _normalize_argv_for_backward_compat(argv: list[str]) -> list[str]:
