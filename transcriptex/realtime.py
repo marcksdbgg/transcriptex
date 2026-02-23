@@ -89,12 +89,16 @@ class RealtimeTranscriber:
             self.audio_queue.put(audio_data.copy())
         return (in_data, pa.paContinue)
 
-    def _update_terminal_ui(self, text: str):
-        if not text or text == self.last_text:
+    def _update_terminal_ui(self, text: str, metrics: str = ""):
+        if not text:
             return
             
+        if text == self.last_text and metrics == self.last_metrics:
+            return
+            
+        display_str = f"{text} \033[90m{metrics}\033[0m" if metrics else text
         term_width = shutil.get_terminal_size().columns or 80
-        wrapped_lines = textwrap.wrap(text, width=max(10, term_width - 4))
+        wrapped_lines = textwrap.wrap(display_str, width=max(10, term_width - 4))
         
         if self.lines_to_clear > 0:
             for _ in range(self.lines_to_clear):
@@ -105,6 +109,7 @@ class RealtimeTranscriber:
         
         self.lines_to_clear = len(wrapped_lines)
         self.last_text = text
+        self.last_metrics = metrics
 
     def run(self) -> dict:
         print("=================================================================")
@@ -136,8 +141,8 @@ class RealtimeTranscriber:
         # E.g. 2.0s duration -> 3.0s max context. Prevents quadratic processing slowdowns!
         max_buffer_frames = int(native_rate * self.config.chunk_duration * 1.5)
         
-        # Set processing interval natively to 1.0s (accumulate new audio before transcribing)
-        processing_interval = int(native_rate * 1.0)
+        # Set processing interval natively to 0.75s (accumulate new audio before transcribing)
+        processing_interval = int(native_rate * 0.75)
         unprocessed_frames = 0
         
         try:
@@ -207,25 +212,24 @@ class RealtimeTranscriber:
                     else:
                         text = " ".join([seg.text.strip() for seg in segments]).strip()
                     
-                    # Add metrics string behind the scenes to UI
-                    metrics_str = f" [{(len(self.buffer)/native_rate):.1f}s | Q:{self.audio_queue.qsize()} | RT:{rtf:.2f}x]"
+                    # Compute transparent telemetry metrics
+                    metrics_str = f"[{audio_dur:.1f}s | Q:{self.audio_queue.qsize()} | RT:{rtf:.2f}x]"
                     
-                    if text and text != self.last_text:
-                        # Incorporates text + metrics temporarily
-                        self._update_terminal_ui(f"{text} \033[90m{metrics_str}\033[0m")
-                        self.last_text = text
+                    # Delegate the rendering completely dynamically to UI engine
+                    self._update_terminal_ui(text, metrics_str)
                         
                     recent_audio = self.buffer[-native_rate:] if len(self.buffer) >= native_rate else self.buffer
                     rms = np.sqrt(np.mean(recent_audio**2))
                     is_silence = bool(rms < self.SILENCE_THRESHOLD_RMS)
                     
                     if (is_silence or len(self.buffer) >= max_buffer_frames) and self.last_text != "":
-                        # Overwrite metric line without metrics to make it permanent
-                        self._update_terminal_ui(self.last_text)
+                        # Overwrite metric line without metrics to make it permanent (locked on silence)
+                        self._update_terminal_ui(self.last_text, metrics="")
                         
                         self.committed_history += (" " + self.last_text)
                         self.lines_to_clear = 0
                         self.last_text = ""
+                        self.last_metrics = ""
                         
                         if is_silence:
                             self.buffer = np.array([], dtype=np.float32)
