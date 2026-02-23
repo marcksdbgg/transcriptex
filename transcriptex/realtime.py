@@ -60,10 +60,10 @@ def get_wasapi_loopback():
 
 def resample_np(data: np.ndarray, orig_sr: int, target_sr: int = 16000) -> np.ndarray:
     if orig_sr == target_sr:
-        return data
+        return data.astype(np.float32)
     n_samples = int(len(data) * target_sr / orig_sr)
     indices = np.linspace(0, len(data) - 1, n_samples)
-    return np.interp(indices, np.arange(len(data)), data)
+    return np.interp(indices, np.arange(len(data)), data).astype(np.float32)
 
 
 def run_realtime(config: RealtimeConfig):
