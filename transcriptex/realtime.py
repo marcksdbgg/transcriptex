@@ -143,20 +143,44 @@ def run_realtime(config: RealtimeConfig):
                         beam_size=config.beam_size,
                         language=config.language if config.language else None,
                         condition_on_previous_text=False,
+                        vad_filter=True, # Prevent hallucinating background noise
+                        vad_parameters=dict(min_silence_duration_ms=500)
                     )
                     
-                    text = " ".join([seg.text.strip() for seg in segments]).strip()
+                    # Restrict languages to English or Spanish if not explicitly set
+                    if not config.language and info.language not in ["en", "es"]:
+                        text = ""
+                    else:
+                        text = " ".join([seg.text.strip() for seg in segments]).strip()
                     
-                    if text and text != last_text:
+                    if text:
+                        # Clear line and print ongoing chunk
                         sys.stdout.write(f"\r\033[K{text}")
                         sys.stdout.flush()
                         last_text = text
                         
+                    # Calculate simple RMS energy of the most recent ~1s chunk to detect silence
+                    # This allows us to "lock in" the text and move to a new line when the user finishes speaking.
+                    recent_audio = buffer[-native_rate:] if len(buffer) >= native_rate else buffer
+                    rms = np.sqrt(np.mean(recent_audio**2))
+                    is_silence = bool(rms < 0.005) # Empirically low threshold for silence detection
+                    
+                    # Lock text if they stopped talking, OR if buffer is getting huge (>25 seconds)
+                    if (is_silence or len(buffer) > native_rate * 25) and last_text != "":
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        last_text = ""
+                        # If silence, we can safely clear the buffer
+                        if is_silence:
+                            buffer = np.array([], dtype=np.float32)
+                        else:
+                            # Keep 1.5s overlap if we are just flushing due to max length
+                            buffer = buffer[-int(native_rate * 1.5):]
+                            
                 except Exception as e:
                     print(f"\n[Error processing chunk: {e}]", end="")
-                
-                # keep some overlap to avoid harsh cuts
-                buffer = buffer[-int(native_rate * 1.5):] 
+                    # keep some overlap to avoid harsh cuts if transcription failed
+                    buffer = buffer[-int(native_rate * 1.5):]
                 
     except KeyboardInterrupt:
         print("\n\n  Stopped by user.")
