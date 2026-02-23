@@ -136,12 +136,16 @@ class RealtimeTranscriber:
         # E.g. 2.0s duration -> 3.0s max context. Prevents quadratic processing slowdowns!
         max_buffer_frames = int(native_rate * self.config.chunk_duration * 1.5)
         
+        # Set processing interval natively to 1.0s (accumulate new audio before transcribing)
+        processing_interval = int(native_rate * 1.0)
+        unprocessed_frames = 0
+        
         try:
             stream = p.open(
                 format=pa.paFloat32,
                 channels=channels,
                 rate=native_rate,
-                frames_per_buffer=int(native_rate * 0.5), # 0.5s blocks
+                frames_per_buffer=int(native_rate * 0.5), # 0.5s chunks
                 input=True,
                 input_device_index=loopback_device["index"],
                 stream_callback=lambda *args: self._audio_callback(*args, pa=pa, channels=channels)
@@ -150,55 +154,86 @@ class RealtimeTranscriber:
             stream.start_stream()
             self.is_running = True
             
+            import time
             while self.is_running and stream.is_active():
                 try:
                     chunk = self.audio_queue.get(timeout=1.0)
+                    self.buffer = np.concatenate((self.buffer, chunk))
+                    unprocessed_frames += len(chunk)
+                    
+                    # Drain queue to catch up perfectly if the GPU took slightly longer
+                    while not self.audio_queue.empty():
+                        ch = self.audio_queue.get_nowait()
+                        self.buffer = np.concatenate((self.buffer, ch))
+                        unprocessed_frames += len(ch)
+                        
                 except queue.Empty:
+                    # If empty, but buffer hasn't reached even processing interval, wait more
+                    if len(self.buffer) < native_rate * self.config.chunk_duration:
+                        continue
+                
+                # Check if we have gathered enough context (initial startup delay)
+                if len(self.buffer) < native_rate * self.config.chunk_duration:
                     continue
                     
-                self.buffer = np.concatenate((self.buffer, chunk))
-                
-                if len(self.buffer) >= native_rate * self.config.chunk_duration:
-                    resampled = self._resample(self.buffer, native_rate)
+                # Ensure we only compute if new audio arrived (prevents repetitive loop lag)
+                if unprocessed_frames < processing_interval:
+                    continue
                     
-                    try:
-                        # Feed recent history backwards to model so it understands chopped context
-                        prompt = self.committed_history[-150:] if self.committed_history else None
+                unprocessed_frames = 0
+                resampled = self._resample(self.buffer, native_rate)
+                
+                try:
+                    t0 = time.time()
+                    prompt = self.committed_history[-150:] if self.committed_history else None
+                    
+                    segments, info = self.model.transcribe(
+                        resampled,
+                        beam_size=self.config.beam_size,
+                        initial_prompt=prompt,
+                        language=self.config.language if self.config.language else None,
+                        condition_on_previous_text=False,
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=400)
+                    )
+                    
+                    t1 = time.time()
+                    audio_dur = len(self.buffer) / native_rate
+                    proc_time = t1 - t0
+                    rtf = proc_time / audio_dur if audio_dur > 0 else 0.0
+                    
+                    if not self.config.language and info.language not in ["en", "es"]:
+                        text = ""
+                    else:
+                        text = " ".join([seg.text.strip() for seg in segments]).strip()
+                    
+                    # Add metrics string behind the scenes to UI
+                    metrics_str = f" [{(len(self.buffer)/native_rate):.1f}s | Q:{self.audio_queue.qsize()} | RT:{rtf:.2f}x]"
+                    
+                    if text and text != self.last_text:
+                        # Incorporates text + metrics temporarily
+                        self._update_terminal_ui(f"{text} \033[90m{metrics_str}\033[0m")
+                        self.last_text = text
                         
-                        segments, info = self.model.transcribe(
-                            resampled,
-                            beam_size=self.config.beam_size,
-                            initial_prompt=prompt,
-                            language=self.config.language if self.config.language else None,
-                            condition_on_previous_text=False,
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400)
-                        )
+                    recent_audio = self.buffer[-native_rate:] if len(self.buffer) >= native_rate else self.buffer
+                    rms = np.sqrt(np.mean(recent_audio**2))
+                    is_silence = bool(rms < self.SILENCE_THRESHOLD_RMS)
+                    
+                    if (is_silence or len(self.buffer) >= max_buffer_frames) and self.last_text != "":
+                        # Overwrite metric line without metrics to make it permanent
+                        self._update_terminal_ui(self.last_text)
                         
-                        if not self.config.language and info.language not in ["en", "es"]:
-                            text = ""
+                        self.committed_history += (" " + self.last_text)
+                        self.lines_to_clear = 0
+                        self.last_text = ""
+                        
+                        if is_silence:
+                            self.buffer = np.array([], dtype=np.float32)
                         else:
-                            text = " ".join([seg.text.strip() for seg in segments]).strip()
-                        
-                        self._update_terminal_ui(text)
+                            self.buffer = self.buffer[-int(native_rate * 0.5):]
                             
-                        recent_audio = self.buffer[-native_rate:] if len(self.buffer) >= native_rate else self.buffer
-                        rms = np.sqrt(np.mean(recent_audio**2))
-                        is_silence = bool(rms < self.SILENCE_THRESHOLD_RMS)
-                        
-                        # Lock if silence OR if forced by buffer limit
-                        if (is_silence or len(self.buffer) >= max_buffer_frames) and self.last_text != "":
-                            self.committed_history += (" " + self.last_text)
-                            self.lines_to_clear = 0
-                            self.last_text = ""
-                            
-                            if is_silence:
-                                self.buffer = np.array([], dtype=np.float32)
-                            else:
-                                self.buffer = self.buffer[-int(native_rate * 0.5):]
-                                
-                    except Exception as e:
-                        self.buffer = self.buffer[-int(native_rate * 0.5):]
+                except Exception as e:
+                    self.buffer = self.buffer[-int(native_rate * 0.5):]
                 
         except KeyboardInterrupt:
             print("\n\n  Stopped by user.")
