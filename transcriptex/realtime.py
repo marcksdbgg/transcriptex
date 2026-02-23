@@ -107,8 +107,12 @@ def run_realtime(config: RealtimeConfig):
             audio_queue.put(audio_data.copy())
         return (in_data, pa.paContinue)
 
+    import textwrap
+    import shutil
+
     buffer = np.array([], dtype=np.float32)
     last_text = ""
+    lines_to_clear = 0
     
     WHISPER_SR = 16000
 
@@ -133,6 +137,9 @@ def run_realtime(config: RealtimeConfig):
                 
             buffer = np.concatenate((buffer, chunk))
             
+            # Use dynamic max length (3 chunks max e.g. 9 seconds for 3s duration)
+            max_buffer_frames = int(native_rate * config.chunk_duration * 3.0)
+            
             if len(buffer) >= native_rate * config.chunk_duration:
                 # Resample buffer to 16000Hz for whisper
                 resampled = resample_np(buffer, native_rate, WHISPER_SR)
@@ -153,34 +160,43 @@ def run_realtime(config: RealtimeConfig):
                     else:
                         text = " ".join([seg.text.strip() for seg in segments]).strip()
                     
-                    if text:
-                        # Clear line and print ongoing chunk
-                        sys.stdout.write(f"\r\033[K{text}")
+                    if text and text != last_text:
+                        term_width = shutil.get_terminal_size().columns or 80
+                        wrapped_lines = textwrap.wrap(text, width=max(10, term_width - 4))
+                        
+                        # Move cursor up and clear exactly the lines we printed previously
+                        if lines_to_clear > 0:
+                            for _ in range(lines_to_clear):
+                                sys.stdout.write("\033[F\033[K")
+                                
+                        # Print the new lines
+                        sys.stdout.write("\n".join(wrapped_lines) + "\n")
                         sys.stdout.flush()
+                        
+                        lines_to_clear = len(wrapped_lines)
                         last_text = text
                         
                     # Calculate simple RMS energy of the most recent ~1s chunk to detect silence
-                    # This allows us to "lock in" the text and move to a new line when the user finishes speaking.
                     recent_audio = buffer[-native_rate:] if len(buffer) >= native_rate else buffer
                     rms = np.sqrt(np.mean(recent_audio**2))
-                    is_silence = bool(rms < 0.005) # Empirically low threshold for silence detection
+                    is_silence = bool(rms < 0.005) 
                     
-                    # Lock text if they stopped talking, OR if buffer is getting huge (>25 seconds)
-                    if (is_silence or len(buffer) > native_rate * 25) and last_text != "":
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                    # Lock text if they stopped talking, OR if buffer is at max capacity
+                    if (is_silence or len(buffer) >= max_buffer_frames) and last_text != "":
+                        # Leave the printed text alone, reset tracking variables
+                        lines_to_clear = 0
                         last_text = ""
-                        # If silence, we can safely clear the buffer
+                        # Safely clear the buffer
                         if is_silence:
                             buffer = np.array([], dtype=np.float32)
                         else:
-                            # Keep 1.5s overlap if we are just flushing due to max length
-                            buffer = buffer[-int(native_rate * 1.5):]
+                            # Keep 1.0s overlap to avoid hard cuts during continuous speech
+                            buffer = buffer[-int(native_rate * 1.0):]
                             
                 except Exception as e:
-                    print(f"\n[Error processing chunk: {e}]", end="")
-                    # keep some overlap to avoid harsh cuts if transcription failed
-                    buffer = buffer[-int(native_rate * 1.5):]
+                    # ignore decoding chunk exceptions mostly (e.g., transient silence issues)
+                    # keep minimal buffer not to hang completely
+                    buffer = buffer[-int(native_rate * 1.0):]
                 
     except KeyboardInterrupt:
         print("\n\n  Stopped by user.")
