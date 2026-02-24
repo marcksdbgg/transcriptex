@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 from collections import deque
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -10,6 +12,7 @@ from transcriptex.models import ChannelInfo, PlaylistRecord, VideoRecord
 from transcriptex.url_utils import (
     channel_tab_url,
     extract_playlist_id,
+
     extract_video_id,
     normalize_relative_youtube_url,
     video_url_from_id,
@@ -125,6 +128,48 @@ class YouTubeClient:
         )
         with urlopen(request, timeout=self.timeout) as response:
             return response.read()
+
+    def download_audio(self, url: str, tmp_dir: Path, out_name: str = "audio") -> Path:
+        """
+        Download best audio from a YouTube URL to tmp_dir using yt-dlp.
+        Returns the path to the downloaded audio file (.wav fallback).
+        """
+        yt_dlp = _require_yt_dlp()
+        output_template = str(tmp_dir / f"{out_name}.%(ext)s")
+
+        ydl_opts: dict[str, Any] = {
+            "quiet": not self.verbose,
+            "no_warnings": not self.verbose,
+            "noprogress": not self.verbose,
+            "format": "bestaudio/best",
+            "outtmpl": output_template,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "wav",
+                    "preferredquality": "0",
+                }
+            ],
+            "ignoreerrors": False,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise RuntimeError("yt-dlp returned empty metadata — video may be private or unavailable")
+
+        # Find the downloaded WAV file
+        wav_candidates = list(tmp_dir.glob("*.wav"))
+        if wav_candidates:
+            return wav_candidates[0]
+
+        # Fallback: any audio file
+        for ext in ("m4a", "webm", "opus", "mp3", "ogg", "flac"):
+            candidates = list(tmp_dir.glob(f"*.{ext}"))
+            if candidates:
+                return candidates[0]
+
+        raise RuntimeError(f"No audio file found in {tmp_dir} after download")
 
     def _videos_from_entries(self, info: dict[str, Any], fallback_channel: str = "") -> list[VideoRecord]:
         videos: list[VideoRecord] = []

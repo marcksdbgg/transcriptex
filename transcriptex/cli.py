@@ -270,13 +270,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="Download audio if URL, then transcribe using local faster-whisper.",
     )
     transcribe_parser.add_argument("input_path", help="Local file path or YouTube URL")
-    transcribe_parser.add_argument("-o", "--output", default=".", help="Output directory (default: current)")
-    transcribe_parser.add_argument("--format", default="srt", choices=["txt", "json", "srt", "vtt"], help="Output format (default: srt)")
-    transcribe_parser.add_argument("--model", default="large-v3-turbo", help="Whisper model name (default: large-v3-turbo)")
-    transcribe_parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Inference device (default: cuda)")
-    transcribe_parser.add_argument("--compute-type", default="float16", help="Model quantization (default: float16)")
-    transcribe_parser.add_argument("--language", default="", help="Language code (default: auto)")
-    transcribe_parser.add_argument("--beam-size", type=int, default=5, help="Beam search size (default: 5)")
+    transcribe_parser.add_argument("-o", "--output", default="", help="Output directory (default: same folder as input file; current dir for YouTube URLs)")
+    transcribe_parser.add_argument(
+        "--format",
+        default="txt",
+        choices=["txt", "srt", "vtt", "json"],
+        help=(
+            "Output format (default: txt).\n"
+            "  txt  — clean plain text, words joined, paragraph breaks on long silences (DEFAULT)\n"
+            "  srt  — numbered subtitles with timestamps (00:00:00,000 --> 00:00:00,000)\n"
+            "  vtt  — WebVTT subtitles (compatible with HTML5 <track>, .vtt files)\n"
+            "  json — full segment data as JSON array [{start, end, text}, ...]"
+        ),
+    )
+    transcribe_parser.add_argument("--model", default="large-v3-turbo", help="Whisper model: tiny, base, small, medium, large-v2, large-v3, large-v3-turbo (default: large-v3-turbo)")
+    transcribe_parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Inference device: auto, cuda, cpu (default: auto — uses GPU if available, else CPU)")
+    transcribe_parser.add_argument("--compute-type", default="auto", help="Quantization: auto, float16, int8_float16, int8, float32 (default: auto — float16 for GPU, int8 for CPU)")
+    transcribe_parser.add_argument("--language", default="", help="Language code, e.g. 'es' or 'en' (default: auto-detect)")
+    transcribe_parser.add_argument("--beam-size", type=int, default=5, help="Beam search size, higher = better quality but slower (default: 5)")
     transcribe_parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
 
     realtime_parser = subparsers.add_parser(
@@ -443,13 +454,41 @@ def _run_asr(args: argparse.Namespace) -> int:
 def _run_transcribe_single(args: argparse.Namespace) -> int:
     from transcriptex.transcribe_single import TranscribeSingleConfig, run_transcribe_single
 
+    input_path = args.input_path
+    is_url = input_path.startswith("http://") or input_path.startswith("https://")
+
+    # Resolve output directory:
+    # - If explicitly provided: use it.
+    # - If local file and no output given: save next to the input file.
+    # - If URL and no output given: use current directory.
+    if args.output:
+        output_dir = Path(args.output).resolve()
+    elif not is_url:
+        output_dir = Path(input_path).resolve().parent
+    else:
+        output_dir = Path(".").resolve()
+
+    # Resolve device/compute-type: "auto" → detect GPU, fallback CPU
+    device = args.device
+    compute_type = args.compute_type
+    if device == "auto" or compute_type == "auto":
+        try:
+            import torch
+            gpu_available = torch.cuda.is_available()
+        except ImportError:
+            gpu_available = False
+        if device == "auto":
+            device = "cuda" if gpu_available else "cpu"
+        if compute_type == "auto":
+            compute_type = "float16" if (device == "cuda") else "int8"
+
     config = TranscribeSingleConfig(
-        input_path=args.input_path,
-        output_dir=Path(args.output).resolve(),
+        input_path=input_path,
+        output_dir=output_dir,
         output_format=args.format,
         model=args.model,
-        device=args.device,
-        compute_type=args.compute_type,
+        device=device,
+        compute_type=compute_type,
         language=args.language,
         beam_size=max(1, int(args.beam_size)),
         verbose=bool(args.verbose),
