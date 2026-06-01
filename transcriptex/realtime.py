@@ -15,6 +15,9 @@ class RealtimeConfig:
     language: str
     beam_size: int
     chunk_duration: float = 2.0
+    process: str = ""
+    list_devices: bool = False
+    device_index: int = -1
 
 
 class RealtimeTranscriber:
@@ -42,20 +45,55 @@ class RealtimeTranscriber:
     def _init_whisper(self):
         print(f"  [ASR] Initializing faster-whisper ({self.config.model})...")
         from faster_whisper import WhisperModel
-        return WhisperModel(
-            self.config.model,
-            device=self.config.device,
-            compute_type=self.config.compute_type,
-        )
+        
+        device = self.config.device
+        compute_type = self.config.compute_type
+        
+        try:
+            model = WhisperModel(
+                self.config.model,
+                device=device,
+                compute_type=compute_type,
+            )
+            return model
+        except Exception as e:
+            if device == "cuda" and ("cublas" in str(e).lower() or "cuda" in str(e).lower()):
+                print(f"  [WARN] CUDA libraries not available ({e})")
+                print("  [WARN] Falling back to CPU (int8). Install CUDA toolkit for GPU support.")
+                print("         Download from: https://developer.nvidia.com/cuda-downloads")
+                model = WhisperModel(
+                    self.config.model,
+                    device="cpu",
+                    compute_type="int8",
+                )
+                return model
+            raise
 
-    def _get_wasapi_loopback(self):
+    def _list_devices(self):
+        import pyaudiowpatch as pa
+        p = pa.PyAudio()
+        print("=== WASAPI Loopback Devices ===\n")
+        for i, d in enumerate(p.get_loopback_device_info_generator()):
+            print(f"  {i}: {d['name']}")
+            print(f"     Channels: {d['maxInputChannels']}, Rate: {int(d['defaultSampleRate'])} Hz\n")
+        p.terminate()
+
+    def _get_wasapi_loopback(self, device_index: int = -1):
         import pyaudiowpatch as pa
         p = pa.PyAudio()
         try:
             wasapi_info = p.get_host_api_info_by_type(pa.paWASAPI)
         except OSError:
             return None, None
-            
+
+        if device_index >= 0:
+            loopback_devices = list(p.get_loopback_device_info_generator())
+            if device_index < len(loopback_devices):
+                return p, loopback_devices[device_index]
+            else:
+                print(f"  [ERR] Device index {device_index} out of range (0-{len(loopback_devices)-1})")
+                return None, None
+
         default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
         
         if not default_speakers.get("isLoopbackDevice", False):
@@ -64,7 +102,6 @@ class RealtimeTranscriber:
                     default_speakers = loopback
                     break
             if not default_speakers.get("isLoopbackDevice", False):
-                # Fallback
                 for loopback in p.get_loopback_device_info_generator():
                     default_speakers = loopback
                     break
@@ -112,12 +149,235 @@ class RealtimeTranscriber:
         self.last_metrics = metrics
 
     def run(self) -> dict:
+        if self.config.list_devices:
+            self._list_devices()
+            return {"success": True}
+
         print("=================================================================")
         print("  Realtime Transcription (WASAPI Loopback)")
         print("=================================================================")
         print(f"  Model             : {self.config.model}")
         print(f"  Device            : {self.config.device} ({self.config.compute_type})")
+        if self.config.process:
+            print(f"  Target Process    : {self.config.process}")
         print("=================================================================\n")
+
+        if self.config.process:
+            return self._run_pac_loop()
+        else:
+            return self._run_wasapi_loop()
+
+    def _run_pac_loop(self) -> dict:
+        try:
+            import process_audio_capture as pac
+        except ImportError:
+            print("  [ERR] process_audio_capture not installed. Run: pip install process-audio-capture pywin32")
+            return {"success": False, "error": "Missing dependencies"}
+
+        try:
+            import win32pipe, win32file, pywintypes
+        except ImportError:
+            print("  [ERR] pywin32 not installed. Run: pip install pywin32")
+            return {"success": False, "error": "Missing pywin32"}
+
+        procs = pac.ProcessAudioCapture.enumerate_audio_processes()
+        target_pid = None
+        target_name = None
+        for p in procs:
+            if self.config.process.lower() in p.name.lower() or self.config.process.lower() in p.window_title.lower():
+                target_pid = p.pid
+                target_name = p.name
+                break
+
+        if not target_pid:
+            print(f"  [ERR] Process '{self.config.process}' not found among processes outputting audio.")
+            print("        Currently active processes:")
+            for p in procs:
+                print(f"        - {p.name} (PID: {p.pid})")
+            return {"success": False, "error": "Process not found"}
+
+        print(f"  [OK] Found Target Process: {target_name} (PID: {target_pid})")
+
+        import struct
+        pipe_name = r'\\.\pipe\transcriptex_app_loopback'
+        read_thread_err = None
+
+        def pipe_reader():
+            nonlocal read_thread_err
+            # Create Named Pipe
+            handle = win32pipe.CreateNamedPipe(
+                pipe_name,
+                win32pipe.PIPE_ACCESS_INBOUND,
+                win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+                1, 65536 * 4, 65536 * 4, 0, None)
+            
+            try:
+                win32pipe.ConnectNamedPipe(handle, None)
+                
+                # Parse WAV header
+                # RIFF header
+                _, buffer = win32file.ReadFile(handle, 12)
+                
+                channels = 2
+                native_rate = 48000
+                bits = 32
+                
+                while True:
+                    _, chunk_header = win32file.ReadFile(handle, 8)
+                    if len(chunk_header) < 8:
+                        break
+                    chunk_id, chunk_size = struct.unpack('<4sI', chunk_header)
+                    
+                    if chunk_id == b'fmt ':
+                        _, fmt_data = win32file.ReadFile(handle, chunk_size)
+                        _, channels, native_rate, _, _, bits = struct.unpack('<HHIIHH', fmt_data[:16])
+                    elif chunk_id == b'data':
+                        break
+                    else:
+                        _, _ = win32file.ReadFile(handle, chunk_size)
+                
+                bytes_per_sample = bits // 8
+                # Read chunks of ~0.5s
+                chunk_bytes = int(native_rate * 0.5) * channels * bytes_per_sample
+                
+                while self.is_running:
+                    err, raw_data = win32file.ReadFile(handle, chunk_bytes)
+                    if not raw_data:
+                        break
+                    
+                    if bits == 32:
+                        audio_data = np.frombuffer(raw_data, dtype=np.float32)
+                    elif bits == 16:
+                        audio_data = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    else:
+                        continue # Unsupported depth
+                        
+                    if channels > 1:
+                        audio_data = audio_data.reshape((-1, channels)).mean(axis=1)
+                        
+                    self.audio_queue.put(audio_data.copy(), timeout=2.0)
+                    
+            except Exception as e:
+                if self.is_running:
+                    read_thread_err = e
+            finally:
+                win32file.CloseHandle(handle)
+
+        import threading
+        t = threading.Thread(target=pipe_reader, daemon=True)
+        t.start()
+        
+        # Give pipe_reader a moment to setup server
+        import time
+        time.sleep(0.5)
+
+        print("  [OK] Whisper ready. Listening for target application audio... (Press Ctrl+C to stop)")
+        
+        self.is_running = True
+        
+        try:
+            with pac.ProcessAudioCapture(pid=target_pid, output_path=pipe_name) as capture:
+                capture.start()
+                
+                # Assume default rate since we process dynamic chunk sizing anyway 
+                native_rate = 48000
+                
+                max_buffer_frames = int(native_rate * self.config.chunk_duration * 1.5)
+                processing_interval = int(native_rate * 0.75)
+                unprocessed_frames = 0
+                
+                while self.is_running and t.is_alive():
+                    if read_thread_err:
+                        raise read_thread_err
+                        
+                    try:
+                        chunk = self.audio_queue.get(timeout=1.0)
+                        self.buffer = np.concatenate((self.buffer, chunk))
+                        unprocessed_frames += len(chunk)
+                        
+                        while not self.audio_queue.empty():
+                            ch = self.audio_queue.get_nowait()
+                            self.buffer = np.concatenate((self.buffer, ch))
+                            unprocessed_frames += len(ch)
+                            
+                    except queue.Empty:
+                        if len(self.buffer) < native_rate * self.config.chunk_duration:
+                            continue
+                    
+                    if len(self.buffer) < native_rate * self.config.chunk_duration:
+                        continue
+                        
+                    if unprocessed_frames < processing_interval:
+                        continue
+                        
+                    unprocessed_frames = 0
+                    resampled = self._resample(self.buffer, native_rate)
+                    
+                    self._process_whisper_chunk(resampled, audio_dur=len(self.buffer)/native_rate, 
+                                                native_rate=native_rate, max_buffer_frames=max_buffer_frames)
+                    
+        except KeyboardInterrupt:
+            print("\n\n  Stopped by user.")
+        except Exception as e:
+            print(f"\n  [ERR] {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            self.is_running = False
+            t.join(timeout=1.0)
+
+        return {"success": True}
+
+    def _process_whisper_chunk(self, resampled: np.ndarray, audio_dur: float, native_rate: int, max_buffer_frames: int):
+        import time
+        try:
+            t0 = time.time()
+            prompt = self.committed_history[-150:] if self.committed_history else None
+            
+            segments, info = self.model.transcribe(
+                resampled,
+                beam_size=self.config.beam_size,
+                initial_prompt=prompt,
+                language=self.config.language if self.config.language else None,
+                condition_on_previous_text=False,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400)
+            )
+            
+            t1 = time.time()
+            proc_time = t1 - t0
+            rtf = proc_time / audio_dur if audio_dur > 0 else 0.0
+            
+            if not self.config.language and info.language not in ["en", "es"]:
+                text = ""
+            else:
+                text = " ".join([seg.text.strip() for seg in segments]).strip()
+            
+            metrics_str = f"[{audio_dur:.1f}s | Q:{self.audio_queue.qsize()} | RT:{rtf:.2f}x]"
+            
+            self._update_terminal_ui(text, metrics_str)
+                
+            recent_audio = self.buffer[-native_rate:] if len(self.buffer) >= native_rate else self.buffer
+            rms = np.sqrt(np.mean(recent_audio**2))
+            is_silence = bool(rms < self.SILENCE_THRESHOLD_RMS)
+            
+            if (is_silence or len(self.buffer) >= max_buffer_frames) and self.last_text != "":
+                self._update_terminal_ui(self.last_text, metrics="")
+                
+                self.committed_history += (" " + self.last_text)
+                self.lines_to_clean = 0
+                self.last_text = ""
+                self.last_metrics = ""
+                
+                if is_silence:
+                    self.buffer = np.array([], dtype=np.float32)
+                else:
+                    self.buffer = self.buffer[-int(native_rate * 0.5):]
+                    
+        except Exception as e:
+            self.buffer = self.buffer[-int(native_rate * 0.5):]
+
+
+    def _run_wasapi_loop(self) -> dict:
 
         try:
             import pyaudiowpatch as pa
@@ -125,7 +385,7 @@ class RealtimeTranscriber:
             print("  [ERR] pyaudiowpatch not installed. Run: pip install pyaudiowpatch numpy")
             return {"success": False, "error": "Missing dependencies"}
 
-        p, loopback_device = self._get_wasapi_loopback()
+        p, loopback_device = self._get_wasapi_loopback(self.config.device_index)
         
         if not loopback_device:
             print("  [ERR] No WASAPI Loopback device found. Are you on Windows?")
@@ -188,57 +448,9 @@ class RealtimeTranscriber:
                 unprocessed_frames = 0
                 resampled = self._resample(self.buffer, native_rate)
                 
-                try:
-                    t0 = time.time()
-                    prompt = self.committed_history[-150:] if self.committed_history else None
-                    
-                    segments, info = self.model.transcribe(
-                        resampled,
-                        beam_size=self.config.beam_size,
-                        initial_prompt=prompt,
-                        language=self.config.language if self.config.language else None,
-                        condition_on_previous_text=False,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=400)
-                    )
-                    
-                    t1 = time.time()
-                    audio_dur = len(self.buffer) / native_rate
-                    proc_time = t1 - t0
-                    rtf = proc_time / audio_dur if audio_dur > 0 else 0.0
-                    
-                    if not self.config.language and info.language not in ["en", "es"]:
-                        text = ""
-                    else:
-                        text = " ".join([seg.text.strip() for seg in segments]).strip()
-                    
-                    # Compute transparent telemetry metrics
-                    metrics_str = f"[{audio_dur:.1f}s | Q:{self.audio_queue.qsize()} | RT:{rtf:.2f}x]"
-                    
-                    # Delegate the rendering completely dynamically to UI engine
-                    self._update_terminal_ui(text, metrics_str)
-                        
-                    recent_audio = self.buffer[-native_rate:] if len(self.buffer) >= native_rate else self.buffer
-                    rms = np.sqrt(np.mean(recent_audio**2))
-                    is_silence = bool(rms < self.SILENCE_THRESHOLD_RMS)
-                    
-                    if (is_silence or len(self.buffer) >= max_buffer_frames) and self.last_text != "":
-                        # Overwrite metric line without metrics to make it permanent (locked on silence)
-                        self._update_terminal_ui(self.last_text, metrics="")
-                        
-                        self.committed_history += (" " + self.last_text)
-                        self.lines_to_clear = 0
-                        self.last_text = ""
-                        self.last_metrics = ""
-                        
-                        if is_silence:
-                            self.buffer = np.array([], dtype=np.float32)
-                        else:
-                            self.buffer = self.buffer[-int(native_rate * 0.5):]
-                            
-                except Exception as e:
-                    self.buffer = self.buffer[-int(native_rate * 0.5):]
-                
+                self._process_whisper_chunk(resampled, audio_dur=len(self.buffer)/native_rate, 
+                                            native_rate=native_rate, max_buffer_frames=max_buffer_frames)
+                                                
         except KeyboardInterrupt:
             print("\n\n  Stopped by user.")
         except Exception as e:

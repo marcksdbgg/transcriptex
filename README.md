@@ -277,6 +277,7 @@ Press **Ctrl+C** to stop.
 | `--language` | *(auto-detect)* | Language code. Empty = auto-detect |
 | `--beam-size` | `1` | Beam size (1 = fastest for live use) |
 | `--chunk-duration` | `3.0` | Audio buffer window duration in seconds |
+| `--process` | *(empty)* | Captures audio only from a specific process by name (e.g. `zen.exe`). Requires Windows 10/11 Application Loopback. |
 
 #### Example
 

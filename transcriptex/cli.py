@@ -301,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_parser.add_argument("--language", default="", help="Language code (default: auto)")
     realtime_parser.add_argument("--beam-size", type=int, default=1, help="Beam search size (default: 1 for latency)")
     realtime_parser.add_argument("--chunk-duration", type=float, default=3.0, help="Audio buffer block duration in seconds (default: 3.0)")
+    realtime_parser.add_argument("--process", default="", help="Select a specific process to capture from by name (e.g. 'zen.exe')")
+    realtime_parser.add_argument("--list-devices", action="store_true", help="List available WASAPI loopback audio devices and exit")
+    realtime_parser.add_argument("--device-index", type=int, default=-1, help="Select audio device by index (use --list-devices to see available devices)")
 
     return parser
 
@@ -512,6 +515,9 @@ def _run_realtime(args: argparse.Namespace) -> int:
         language=args.language,
         beam_size=max(1, int(args.beam_size)),
         chunk_duration=max(0.5, float(args.chunk_duration)),
+        process=args.process,
+        list_devices=args.list_devices,
+        device_index=args.device_index,
     )
     try:
         report = run_realtime(config)
