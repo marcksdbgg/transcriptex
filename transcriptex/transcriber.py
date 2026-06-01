@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ STATUS_EXISTING = "existing"
 STATUS_NO_SUBTITLES = "no_subtitles"
 STATUS_NO_TEXT = "no_text"
 STATUS_FAILED = "failed"
+PLAYLIST_FETCH_WORKERS = 4
 
 
 @dataclass
@@ -42,6 +45,7 @@ class TranscriberConfig:
     verbose: bool = False
     timeout: int = 30
     sleep_seconds: float = 0.0
+    cookies: str = ""
 
 
 class ChannelTranscriber:
@@ -51,6 +55,7 @@ class ChannelTranscriber:
             retries=self.config.retries,
             timeout=self.config.timeout,
             verbose=self.config.verbose,
+            cookies=self.config.cookies,
         )
 
     def run(self) -> dict[str, Any]:
@@ -74,6 +79,7 @@ class ChannelTranscriber:
             videos_by_id=videos_by_id,
             channel_base_url=channel_base_url,
             fallback_channel=channel_info.title,
+            channel_id=channel_info.channel_id,
         )
         playlists = self._collect_playlists_and_membership(
             channel_base_url=channel_base_url,
@@ -131,6 +137,20 @@ class ChannelTranscriber:
                 result = self._transcribe_video(video=video, transcript_path=transcript_path)
                 if result.status == STATUS_OK and result.transcript_path:
                     existing_transcripts[video_id] = result.transcript_path
+                    # If the video is in multiple playlists, physically copy the
+                    # transcript into each playlist folder so each playlist
+                    # folder has its own self-contained .txt file.
+                    extra_copies = self._replicate_transcript_to_memberships(
+                        video=video,
+                        memberships=memberships,
+                        playlist_folders=playlist_folders,
+                        ungrouped_dir=ungrouped_dir,
+                        source_path=result.transcript_path,
+                    )
+                    if extra_copies > 0:
+                        print(
+                            f"  ↪ replicated transcript to {extra_copies} additional playlist folder(s)"
+                        )
 
             status_counter[result.status] = status_counter.get(result.status, 0) + 1
             playlist_titles = [playlist_by_id[playlist_id].title for playlist_id in memberships if playlist_id in playlist_by_id]
@@ -194,7 +214,32 @@ class ChannelTranscriber:
         videos_by_id: dict[str, VideoRecord],
         channel_base_url: str,
         fallback_channel: str,
+        channel_id: str = "",
     ) -> None:
+        # Primary method: read the channel's uploads playlist (UUxxxx...).
+        # This is a single network call that returns every video uploaded
+        # to the channel — more reliable than walking the videos/shorts/
+        # streams tabs separately (which YouTube throttles and caps).
+        uploads_indexed = 0
+        if channel_id:
+            try:
+                records = self.client.extract_uploads_playlist_videos(
+                    channel_id=channel_id,
+                    fallback_channel=fallback_channel,
+                )
+            except Exception as exc:
+                print(f"Warning: failed to read uploads playlist: {exc}")
+                records = []
+
+            for record in records:
+                self._upsert_video(videos_by_id, record)
+            uploads_indexed = len(records)
+            print(f"Uploads playlist (UU...): {uploads_indexed} videos indexed")
+
+        if uploads_indexed > 0:
+            return
+
+        # Fallback: walk the per-tab endpoints (videos, shorts, streams).
         tabs = self.config.include_tabs or list(DEFAULT_TABS)
         indexed_before = len(videos_by_id)
         for tab in tabs:
@@ -244,16 +289,32 @@ class ChannelTranscriber:
             print(f"Warning: failed to list playlists: {exc}")
             return []
 
-        for playlist in playlists:
-            try:
-                records = self.client.extract_playlist_videos(
+        if not playlists:
+            return []
+
+        # Parallelize playlist video fetching — each playlist is an
+        # independent network call, so we can fan-out to a small thread
+        # pool without risking rate limits (cap at PLAYLIST_FETCH_WORKERS).
+        results_by_id: dict[str, list[VideoRecord]] = {}
+        with ThreadPoolExecutor(max_workers=min(PLAYLIST_FETCH_WORKERS, len(playlists))) as executor:
+            future_to_id = {
+                executor.submit(
+                    self.client.extract_playlist_videos,
                     playlist_url=playlist.url,
                     fallback_channel=fallback_channel,
-                )
-            except Exception as exc:
-                print(f"Warning: failed to read playlist '{playlist.title}': {exc}")
-                records = []
+                ): playlist.playlist_id
+                for playlist in playlists
+            }
+            for future in as_completed(future_to_id):
+                playlist_id = future_to_id[future]
+                try:
+                    results_by_id[playlist_id] = future.result() or []
+                except Exception as exc:
+                    print(f"Warning: failed to read playlist '{playlist_id}': {exc}")
+                    results_by_id[playlist_id] = []
 
+        for playlist in playlists:
+            records = results_by_id.get(playlist.playlist_id, [])
             playlist.videos = records
             for record in records:
                 self._upsert_video(videos_by_id, record)
@@ -337,6 +398,44 @@ class ChannelTranscriber:
             "",
         ]
         path.write_text("\n".join(lines), encoding="utf-8")
+
+    def _replicate_transcript_to_memberships(
+        self,
+        video: VideoRecord,
+        memberships: list[str],
+        playlist_folders: dict[str, Path],
+        ungrouped_dir: Path,
+        source_path: Path,
+    ) -> int:
+        """
+        Copy `source_path` into the folder of every playlist the video is
+        a member of. We use physical copies (not symlinks) for maximum
+        Windows compatibility (symlinks usually require developer mode
+        or admin rights).
+        """
+        if not memberships or not source_path or not source_path.exists():
+            return 0
+
+        transcript_name = source_path.name
+        copies = 0
+        for playlist_id in memberships:
+            target_dir = playlist_folders.get(playlist_id)
+            if not target_dir:
+                # If the playlist folder was not created (rare), fall back
+                # to the ungrouped folder so the file isn't lost.
+                target_dir = ungrouped_dir
+            ensure_dir(target_dir)
+            destination = target_dir / transcript_name
+            if destination == source_path:
+                continue
+            try:
+                shutil.copy2(source_path, destination)
+                copies += 1
+            except Exception as exc:
+                print(
+                    f"Warning: failed to replicate transcript to {destination}: {exc}"
+                )
+        return copies
 
     def _scan_existing_transcripts(self, channel_dir: Path) -> dict[str, Path]:
         existing: dict[str, Path] = {}

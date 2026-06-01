@@ -6,6 +6,7 @@ from pathlib import Path
 
 from transcriptex.audit import AuditConfig, audit_channel_output
 from transcriptex.fs_utils import normalize_list_arg
+from transcriptex.scan import ScanConfig, scan_channel
 from transcriptex.search import SearchConfig, parse_comma_int_list, search_channel_output
 from transcriptex.transcriber import DEFAULT_TABS, ChannelTranscriber, TranscriberConfig
 
@@ -15,7 +16,16 @@ SEARCH_COMMAND = "search"
 ASR_COMMAND = "asr"
 TRANSCRIBE_COMMAND = "transcribe"
 REALTIME_COMMAND = "realtime"
-KNOWN_SUBCOMMANDS = {RUN_COMMAND, AUDIT_COMMAND, SEARCH_COMMAND, ASR_COMMAND, TRANSCRIBE_COMMAND, REALTIME_COMMAND}
+SCAN_COMMAND = "scan"
+KNOWN_SUBCOMMANDS = {
+    RUN_COMMAND,
+    AUDIT_COMMAND,
+    SEARCH_COMMAND,
+    ASR_COMMAND,
+    TRANSCRIBE_COMMAND,
+    REALTIME_COMMAND,
+    SCAN_COMMAND,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Enable yt-dlp verbose output",
+    )
+    run_parser.add_argument(
+        "--cookies",
+        default="",
+        help="Path to a cookies file (Netscape format) for authenticated downloads",
     )
 
     audit_parser = subparsers.add_parser(
@@ -263,6 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose yt-dlp output during audio download",
     )
+    asr_parser.add_argument(
+        "--cookies",
+        default="",
+        help="Path to a cookies file (Netscape format) for authenticated downloads",
+    )
 
     transcribe_parser = subparsers.add_parser(
         TRANSCRIBE_COMMAND,
@@ -305,6 +325,42 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_parser.add_argument("--list-devices", action="store_true", help="List available WASAPI loopback audio devices and exit")
     realtime_parser.add_argument("--device-index", type=int, default=-1, help="Select audio device by index (use --list-devices to see available devices)")
 
+    scan_parser = subparsers.add_parser(
+        SCAN_COMMAND,
+        help="Scan a YouTube channel (or local folder) and report transcript coverage",
+        description=(
+            "Cross-reference a YouTube channel's videos against transcripts on disk and "
+            "write _meta/channel_status.json. Accepts either a channel URL or a path to "
+            "an existing channel folder (with _meta/video_index.csv)."
+        ),
+    )
+    scan_parser.add_argument(
+        "channel_url_or_dir",
+        help="YouTube channel URL or local path to channel folder",
+    )
+    scan_parser.add_argument(
+        "-o",
+        "--output",
+        default="output",
+        help="Output root directory (default: ./output)",
+    )
+    scan_parser.add_argument(
+        "--cookies",
+        default="",
+        help="Path to a cookies file (Netscape format) for authenticated indexing",
+    )
+    scan_parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="Print summary and exit without interactive menu (use in CI / non-TTY envs)",
+    )
+    scan_parser.add_argument(
+        "--page-size",
+        type=int,
+        default=20,
+        help="Number of videos per page in the interactive browser (default: 20)",
+    )
+
     return parser
 
 
@@ -332,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_transcribe_single(args)
     if command == REALTIME_COMMAND:
         return _run_realtime(args)
+    if command == SCAN_COMMAND:
+        return _run_scan(args)
     return _run_export(args)
 
 
@@ -354,6 +412,7 @@ def _run_export(args: argparse.Namespace) -> int:
         verbose=bool(args.verbose),
         timeout=max(5, args.timeout),
         sleep_seconds=max(0.0, args.sleep),
+        cookies=str(getattr(args, "cookies", "") or ""),
     )
 
     transcriber = ChannelTranscriber(config)
@@ -444,6 +503,7 @@ def _run_asr(args: argparse.Namespace) -> int:
         sleep_seconds=max(0.0, float(args.sleep)),
         include_failed=bool(args.include_failed),
         verbose=bool(args.verbose),
+        cookies=str(getattr(args, "cookies", "") or ""),
     )
     try:
         report = run_asr(config)
@@ -526,6 +586,23 @@ def _run_realtime(args: argparse.Namespace) -> int:
         return 1
 
     return 0 if report.get("success") else 1
+
+
+def _run_scan(args: argparse.Namespace) -> int:
+    config = ScanConfig(
+        channel_url_or_dir=str(args.channel_url_or_dir),
+        output_dir=Path(args.output).resolve(),
+        cookies=str(getattr(args, "cookies", "") or ""),
+        no_interactive=bool(args.no_interactive),
+        page_size=max(1, int(args.page_size)),
+    )
+    try:
+        report = scan_channel(config)
+    except Exception as exc:
+        print(f"Fatal error: {exc}")
+        return 1
+
+    return 2 if report.get("pending_count", 0) > 0 else 0
 
 
 def _normalize_argv_for_backward_compat(argv: list[str]) -> list[str]:

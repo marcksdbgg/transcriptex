@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import os
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,17 @@ from typing import Any
 
 # FIX: Disable symlinks on Windows to avoid [WinError 1314] if not Admin/DevMode
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+
+# FIX: Reconfigure stdout/stderr to UTF-8 at module level so that
+# Unicode progress characters (▶, ✓) print correctly on Windows
+# consoles (default cp1252) even when run_asr() is called directly
+# (bypassing the cli.main() reconfigure).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if hasattr(_stream, "reconfigure") and (_stream.encoding or "").lower() != "utf-8":
+            _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from transcriptex.fs_utils import (
     build_transcript_filename,
@@ -69,6 +81,7 @@ class AsrConfig:
     sleep_seconds: float = 0.0
     include_failed: bool = False
     verbose: bool = False
+    cookies: str = ""
 
 
 @dataclass
@@ -227,7 +240,12 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         dl_start = time.time()
         with tempfile.TemporaryDirectory() as tmp_dir:
             try:
-                audio_path = _download_audio(url=url, tmp_dir=Path(tmp_dir), verbose=config.verbose)
+                audio_path = _download_audio(
+                    url=url,
+                    tmp_dir=Path(tmp_dir),
+                    verbose=config.verbose,
+                    cookies=config.cookies,
+                )
             except Exception as exc:
                 dl_time = time.time() - dl_start
                 error_msg = str(exc)
@@ -341,7 +359,7 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
 # Audio download
 # ---------------------------------------------------------------------------
 
-def _download_audio(url: str, tmp_dir: Path, verbose: bool = False) -> Path:
+def _download_audio(url: str, tmp_dir: Path, verbose: bool = False, cookies: str = "") -> Path:
     """
     Download best audio from a YouTube URL to tmp_dir using yt-dlp.
     Returns the path to the downloaded audio file.
@@ -371,6 +389,8 @@ def _download_audio(url: str, tmp_dir: Path, verbose: bool = False) -> Path:
         ],
         "ignoreerrors": False,
     }
+    if cookies:
+        ydl_opts["cookiefile"] = cookies
     if verbose:
         ydl_opts["quiet"] = False
         ydl_opts["no_warnings"] = False

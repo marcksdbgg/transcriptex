@@ -32,13 +32,20 @@ def _require_yt_dlp():
 
 
 class YouTubeClient:
-    def __init__(self, retries: int = 2, timeout: int = 30, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        retries: int = 2,
+        timeout: int = 30,
+        verbose: bool = False,
+        cookies: str = "",
+    ) -> None:
         self.retries = max(0, retries)
         self.timeout = max(5, timeout)
         self.verbose = verbose
+        self.cookies = (cookies or "").strip()
 
     def _base_opts(self, ignoreerrors: bool = True) -> dict[str, Any]:
-        return {
+        options: dict[str, Any] = {
             "quiet": not self.verbose,
             "no_warnings": not self.verbose,
             "ignoreerrors": bool(ignoreerrors),
@@ -47,6 +54,9 @@ class YouTubeClient:
             "socket_timeout": self.timeout,
             "skip_download": True,
         }
+        if self.cookies:
+            options["cookiefile"] = self.cookies
+        return options
 
     def extract_info(self, url: str, flat: bool, ignoreerrors: bool = True) -> dict[str, Any]:
         yt_dlp = _require_yt_dlp()
@@ -107,6 +117,42 @@ class YouTubeClient:
                 )
             )
         return playlists
+
+    @staticmethod
+    def channel_id_to_uploads_playlist_id(channel_id: str) -> str:
+        """
+        Convert a channel ID (UCxxxx...) into the uploads playlist ID (UUxxxx...).
+
+        YouTube's channel uploads playlist always has prefix 'UU' (replacing the
+        'UC' prefix of the channel ID). See:
+        https://stackoverflow.com/questions/29319849/how-to-get-a-list-of-youtube-videos-from-a-channel
+        """
+        value = (channel_id or "").strip()
+        if not value:
+            raise ValueError("channel_id is required")
+        if not value.startswith("UC") or len(value) < 3:
+            raise ValueError(f"Invalid channel ID (expected to start with 'UC'): {value!r}")
+        return "UU" + value[2:]
+
+    def extract_uploads_playlist_videos(
+        self, channel_id: str, fallback_channel: str = ""
+    ) -> list[VideoRecord]:
+        """
+        Fetch every video uploaded to a channel by reading the channel's
+        uploads playlist (UUxxxx...). This is more reliable than walking
+        the videos/shorts/streams tabs separately because it returns the
+        full uploads list in a single call.
+
+        Returns an empty list if the channel ID is empty/invalid or if the
+        network call fails — callers should treat this as a signal to fall
+        back to tab-based extraction.
+        """
+        value = (channel_id or "").strip()
+        if not value or not value.startswith("UC") or len(value) < 3:
+            return []
+        uploads_id = self.channel_id_to_uploads_playlist_id(value)
+        uploads_url = f"https://www.youtube.com/playlist?list={uploads_id}"
+        return self.extract_playlist_videos(uploads_url, fallback_channel=fallback_channel)
 
     def extract_playlist_videos(self, playlist_url: str, fallback_channel: str = "") -> list[VideoRecord]:
         info = self.extract_info(playlist_url, flat=True)
