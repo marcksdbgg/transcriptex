@@ -405,6 +405,69 @@ class ScanChannelUrlModeTests(unittest.TestCase):
         self.assertEqual(report["transcribed_count"], 1)
         self.assertEqual(report["pending_count"], 0)
 
+    def test_scan_url_print_summary_false_silent(self) -> None:
+        """When print_summary=False (e.g. --json or --quiet), the human
+        summary table must NOT be printed to stdout."""
+        uploads = [_make_record("uploadVid01", "Silent Mode")]
+        client = _build_mock_client(uploads=uploads, playlists=[])
+        with mock.patch.object(scan_module, "YouTubeClient", return_value=client):
+            config = ScanConfig(
+                channel_url_or_dir="https://www.youtube.com/@test",
+                output_dir=self.output_dir,
+                no_interactive=True,
+                print_summary=False,
+            )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                report = scan_channel(config)
+        output = buf.getvalue()
+        # The summary table contains "Channel scan summary"
+        self.assertNotIn("Channel scan summary", output)
+        # The function should still return the full report
+        self.assertEqual(report["total_videos"], 1)
+
+    def test_scan_dir_print_summary_false_silent(self) -> None:
+        """In folder mode, print_summary=False must also silence the
+        human summary. (This test is self-contained so it can live in
+        the URL-mode test class without inheriting dir-mode fixtures.)"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            channel_dir = Path(tmp_dir) / "My Channel"
+            meta_dir = channel_dir / "_meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            rows = [
+                {
+                    "video_id": "abc123XYZ_9",
+                    "title": "Silent",
+                    "url": "https://youtube.com/watch?v=abc123XYZ_9",
+                    "assigned_playlist_id": "",
+                    "assigned_playlist_title": "",
+                    "all_playlist_ids": "",
+                    "all_playlist_titles": "",
+                    "folder": "Sin_Playlist",
+                    "transcript_path": "",
+                    "status": "no_subtitles",
+                    "language": "",
+                    "source": "",
+                    "error": "",
+                }
+            ]
+            with (meta_dir / "video_index.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+            config = ScanConfig(
+                channel_url_or_dir=str(channel_dir),
+                no_interactive=True,
+                print_summary=False,
+            )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                report = scan_channel(config)
+            output = buf.getvalue()
+            self.assertNotIn("Channel scan summary", output)
+            self.assertEqual(report["total_videos"], 1)
+
 
 # ---------------------------------------------------------------------------
 # URL vs directory detection
@@ -487,6 +550,153 @@ class CliRegistrationTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.cookies, "/tmp/cookies.txt")
+
+    def test_transcribe_parser_has_cookies(self) -> None:
+        """transcribe should now accept --cookies for YouTube URL input."""
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "transcribe",
+                "https://www.youtube.com/watch?v=abc",
+                "--cookies",
+                "/tmp/cookies.txt",
+            ]
+        )
+        self.assertEqual(args.cookies, "/tmp/cookies.txt")
+
+    def test_version_flag(self) -> None:
+        """The top-level parser must support --version."""
+        parser = build_parser()
+        with self.assertRaises(SystemExit) as ctx:
+            parser.parse_args(["--version"])
+        # SystemExit code 0 on --version
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_reporting_subcommands_have_quiet_and_json(self) -> None:
+        """All reporting subcommands (run, audit, search, asr, scan, transcribe)
+        should expose --quiet and --json for AI-agent friendliness."""
+        from transcriptex.cli import REPORTING_SUBCOMMANDS, build_parser
+        for cmd in REPORTING_SUBCOMMANDS:
+            with self.subTest(command=cmd):
+                parser = build_parser()
+                # Use minimal valid args per command
+                positional = {
+                    "run": ["https://www.youtube.com/@test"],
+                    "audit": ["./output/My Channel"],
+                    "search": ["./output/My Channel", "query"],
+                    "asr": ["./output/My Channel"],
+                    "scan": ["./output/My Channel"],
+                    "transcribe": ["video.mp4"],
+                }[cmd]
+                args = parser.parse_args([cmd, *positional, "--quiet", "--json"])
+                self.assertTrue(args.quiet, f"{cmd} missing --quiet")
+                self.assertTrue(args.json, f"{cmd} missing --json")
+
+    def test_realtime_does_not_have_quiet_json(self) -> None:
+        """realtime streams to stdout, so --quiet/--json don't make sense."""
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["realtime", "--quiet"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["realtime", "--json"])
+
+    def test_help_contains_quickstart_and_exit_codes(self) -> None:
+        """The top-level help must include quick-start recipes and exit codes
+        so AI agents can learn the tool from --help alone."""
+        parser = build_parser()
+        # Format help to a string by triggering SystemExit
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                parser.print_help()
+        except SystemExit:
+            pass
+        text = buf.getvalue()
+        self.assertIn("Quick start", text)
+        self.assertIn("Exit codes", text)
+        self.assertIn("transcriptex run", text)
+        self.assertIn("transcriptex scan", text)
+
+    def test_per_subcommand_help_contains_examples_and_exit_codes(self) -> None:
+        """Each reporting subcommand should print an epilog with examples
+        and documented exit codes."""
+        from transcriptex.cli import REPORTING_SUBCOMMANDS
+        import io as _io
+        from contextlib import redirect_stdout
+        for cmd in REPORTING_SUBCOMMANDS:
+            with self.subTest(command=cmd):
+                parser = build_parser()
+                buf = _io.StringIO()
+                try:
+                    with redirect_stdout(buf):
+                        parser.parse_args([cmd, "--help"])
+                except SystemExit:
+                    pass
+                text = buf.getvalue()
+                self.assertIn("Examples:", text, f"{cmd} help missing 'Examples:'")
+                self.assertIn("Exit codes:", text, f"{cmd} help missing 'Exit codes:'")
+
+    def test_search_help_lists_valid_fields(self) -> None:
+        """--fields help should list every searchable field."""
+        parser = build_parser()
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                parser.parse_args(["search", "--help"])
+        except SystemExit:
+            pass
+        text = buf.getvalue()
+        for field in ("title", "playlist", "video_id", "transcript"):
+            self.assertIn(field, text)
+
+    def test_search_help_lists_valid_statuses(self) -> None:
+        """--status help should list every status value."""
+        parser = build_parser()
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                parser.parse_args(["search", "--help"])
+        except SystemExit:
+            pass
+        text = buf.getvalue()
+        for status in ("ok", "existing", "no_subtitles", "no_text", "failed"):
+            self.assertIn(status, text)
+
+    def test_run_help_lists_valid_tabs(self) -> None:
+        """--tabs help should list every available tab."""
+        parser = build_parser()
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                parser.parse_args(["run", "--help"])
+        except SystemExit:
+            pass
+        text = buf.getvalue()
+        for tab in ("videos", "shorts", "streams", "playlists"):
+            self.assertIn(tab, text)
+
+    def test_run_help_lists_valid_whisper_models(self) -> None:
+        """--model help for asr should list every Whisper model name."""
+        parser = build_parser()
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                parser.parse_args(["asr", "--help"])
+        except SystemExit:
+            pass
+        text = buf.getvalue()
+        for model in ("tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"):
+            self.assertIn(model, text)
 
 
 # ---------------------------------------------------------------------------

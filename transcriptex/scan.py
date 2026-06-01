@@ -54,6 +54,7 @@ class ScanConfig:
     cookies: str = ""
     no_interactive: bool = False
     page_size: int = PAGE_SIZE
+    print_summary: bool = True
 
 
 @dataclass
@@ -110,7 +111,8 @@ def scan_channel(config: ScanConfig) -> dict[str, Any]:
     _write_channel_status(result)
 
     if config.no_interactive:
-        _print_non_interactive_summary(result)
+        if config.print_summary:
+            _print_non_interactive_summary(result)
     else:
         _run_interactive_loop(result, page_size=max(1, int(config.page_size)))
 

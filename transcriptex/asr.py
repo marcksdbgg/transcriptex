@@ -82,6 +82,8 @@ class AsrConfig:
     include_failed: bool = False
     verbose: bool = False
     cookies: str = ""
+    quiet: bool = False
+    print_summary: bool = True
 
 
 @dataclass
@@ -164,26 +166,29 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         eligible_rows = eligible_rows[: config.limit]
 
     total_eligible = len(eligible_rows)
+    quiet = config.quiet
 
     # --- Header ---
-    print()
-    print("=" * 65)
-    print("  ASR Transcription")
-    print("=" * 65)
-    print(f"  Videos to process : {total_eligible}")
-    print(f"  Model             : {config.model}")
-    print(f"  Device            : {config.device} ({config.compute_type})")
-    print(f"  Language           : {config.language}")
-    print(f"  Beam size          : {config.beam_size}")
-    print("=" * 65)
-    print()
+    if not quiet:
+        print()
+        print("=" * 65)
+        print("  ASR Transcription")
+        print("=" * 65)
+        print(f"  Videos to process : {total_eligible}")
+        print(f"  Model             : {config.model}")
+        print(f"  Device            : {config.device} ({config.compute_type})")
+        print(f"  Language           : {config.language}")
+        print(f"  Beam size          : {config.beam_size}")
+        print("=" * 65)
+        print()
 
     if total_eligible == 0:
-        print("Nothing to do — all videos already have transcripts.")
+        if not quiet:
+            print("Nothing to do — all videos already have transcripts.")
         return _build_report(config, rows, [], started_at=now_utc_iso())
 
     # Load model once (expensive operation)
-    model = _load_model(config)
+    model = _load_model(config, quiet=quiet)
 
     started_at = now_utc_iso()
     results: list[AsrResult] = []
@@ -203,7 +208,8 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         channel = row.get("assigned_playlist_title", "").strip()
 
         if not video_id or not url:
-            print(f"  ⚠ [{index}/{total_eligible}] Skipping — missing video_id or url")
+            if not quiet:
+                print(f"  ⚠ [{index}/{total_eligible}] Skipping — missing video_id or url")
             results.append(AsrResult(video_id=video_id, status="skipped", error="Missing video_id or url"))
             skip_count += 1
             continue
@@ -222,7 +228,7 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         if not config.force and video_id in existing_transcripts:
             skip_count += 1
             results.append(AsrResult(video_id=video_id, status="skipped", transcript_path=existing_transcripts[video_id]))
-            if config.verbose:
+            if not quiet and config.verbose:
                 print(f"  ⏭ [{index}/{total_eligible}] {video_id} — skipped (exists)")
             continue
 
@@ -230,13 +236,15 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         short_title = (title[:45] + "...") if len(title) > 45 else title
 
         # Status line: header
-        print(f"  ▶ [{index}/{total_eligible}] {short_title}")
-        print(f"    ID: {video_id}")
+        if not quiet:
+            print(f"  ▶ [{index}/{total_eligible}] {short_title}")
+            print(f"    ID: {video_id}")
 
         t0 = time.time()
 
         # Step 1: Download audio
-        print(f"    ↓ Downloading audio...", end="", flush=True)
+        if not quiet:
+            print(f"    ↓ Downloading audio...", end="", flush=True)
         dl_start = time.time()
         with tempfile.TemporaryDirectory() as tmp_dir:
             try:
@@ -249,8 +257,9 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
             except Exception as exc:
                 dl_time = time.time() - dl_start
                 error_msg = str(exc)
-                print(f" FAILED ({_fmt_duration(dl_time)})")
-                print(f"    ✗ Download error: {error_msg[:120]}")
+                if not quiet:
+                    print(f" FAILED ({_fmt_duration(dl_time)})")
+                    print(f"    ✗ Download error: {error_msg[:120]}")
                 result = AsrResult(video_id=video_id, status="error", error=f"Download failed: {error_msg}")
                 results.append(result)
                 err_count += 1
@@ -261,10 +270,12 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
                 continue
 
             dl_time = time.time() - dl_start
-            print(f" OK ({_fmt_duration(dl_time)})")
+            if not quiet:
+                print(f" OK ({_fmt_duration(dl_time)})")
 
             # Step 2: Transcribe
-            print(f"    🎙 Transcribing...", end="", flush=True)
+            if not quiet:
+                print(f"    🎙 Transcribing...", end="", flush=True)
             tr_start = time.time()
             try:
                 transcript_text, detected_lang = _transcribe_audio(
@@ -275,8 +286,9 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
             except Exception as exc:
                 tr_time = time.time() - tr_start
                 error_msg = str(exc)
-                print(f" FAILED ({_fmt_duration(tr_time)})")
-                print(f"    ✗ Transcription error: {error_msg[:120]}")
+                if not quiet:
+                    print(f" FAILED ({_fmt_duration(tr_time)})")
+                    print(f"    ✗ Transcription error: {error_msg[:120]}")
                 result = AsrResult(video_id=video_id, status="error", error=f"Transcription failed: {error_msg}")
                 results.append(result)
                 err_count += 1
@@ -287,13 +299,15 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
                 continue
 
             tr_time = time.time() - tr_start
-            print(f" OK ({_fmt_duration(tr_time)})")
+            if not quiet:
+                print(f" OK ({_fmt_duration(tr_time)})")
 
         # Step 3: Validate
         total_time = time.time() - t0
 
         if not transcript_text.strip():
-            print(f"    ✗ Empty transcript (silent video?)")
+            if not quiet:
+                print(f"    ✗ Empty transcript (silent video?)")
             result = AsrResult(video_id=video_id, status="error", error="ASR produced empty transcript")
             results.append(result)
             err_count += 1
@@ -335,13 +349,14 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         processing_times.append(total_time)
 
         # Success line + stats
-        remaining = total_eligible - index
-        avg_time = sum(processing_times) / len(processing_times)
-        eta = _fmt_eta(avg_time, remaining)
+        if not quiet:
+            remaining = total_eligible - index
+            avg_time = sum(processing_times) / len(processing_times)
+            eta = _fmt_eta(avg_time, remaining)
 
-        print(f"    ✓ Done in {_fmt_duration(total_time)} | lang={lang_used}")
-        print(f"    {_progress_bar(index, total_eligible)}  OK:{ok_count}  Err:{err_count}  Skip:{skip_count}  ETA: {eta}")
-        print()
+            print(f"    ✓ Done in {_fmt_duration(total_time)} | lang={lang_used}")
+            print(f"    {_progress_bar(index, total_eligible)}  OK:{ok_count}  Err:{err_count}  Skip:{skip_count}  ETA: {eta}")
+            print()
 
         # Save CSV incrementally for crash safety
         _write_video_index(video_index_path, rows)
@@ -351,7 +366,8 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
 
     # Final summary
     report = _build_report(config, rows, results, started_at=started_at)
-    _print_summary(report, wall_start)
+    if config.print_summary:
+        _print_summary(report, wall_start)
     return report
 
 
@@ -419,7 +435,7 @@ def _download_audio(url: str, tmp_dir: Path, verbose: bool = False, cookies: str
 # Transcription
 # ---------------------------------------------------------------------------
 
-def _load_model(config: AsrConfig) -> Any:
+def _load_model(config: AsrConfig, quiet: bool = False) -> Any:
     """
     Load the faster-whisper WhisperModel. Falls back to CPU if CUDA unavailable.
     """
@@ -440,17 +456,21 @@ def _load_model(config: AsrConfig) -> Any:
         try:
             import torch  # type: ignore
             if not torch.cuda.is_available():
-                print("Warning: CUDA not available, falling back to CPU (transcription will be slow)")
+                if not quiet:
+                    print("Warning: CUDA not available, falling back to CPU (transcription will be slow)")
                 device = "cpu"
                 compute_type = "int8"
         except ImportError:
-            print("Warning: torch not installed, falling back to CPU")
+            if not quiet:
+                print("Warning: torch not installed, falling back to CPU")
             device = "cpu"
             compute_type = "int8"
 
-    print(f"Loading Whisper model '{config.model}' on {device} ({compute_type})...")
+    if not quiet:
+        print(f"Loading Whisper model '{config.model}' on {device} ({compute_type})...")
     model = WhisperModel(config.model, device=device, compute_type=compute_type)
-    print("Model loaded.")
+    if not quiet:
+        print("Model loaded.")
     return model
 
 

@@ -53,6 +53,7 @@ class SearchConfig:
     export_ids: list[str] | None = None
     export_indices: list[int] | None = None
     zip_export: bool = False
+    print_summary: bool = True
 
 
 @dataclass
@@ -164,7 +165,7 @@ def search_channel_output(config: SearchConfig) -> dict[str, Any]:
     if config.save_csv:
         search_csv_path = str(_write_search_results_csv(meta_dir=meta_dir, results=top_results, channel_dir=channel_dir))
 
-    if config.print_results:
+    if config.print_results and config.print_summary:
         _print_search_results(
             query=query,
             fields=fields,

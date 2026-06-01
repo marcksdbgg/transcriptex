@@ -22,6 +22,7 @@ class AuditConfig:
     write_files: bool = True
     max_rows_in_console: int = 10
     rename_legacy_files: bool = False
+    print_summary: bool = True
 
 
 def audit_channel_output(config: AuditConfig) -> dict[str, Any]:
@@ -93,11 +94,12 @@ def audit_channel_output(config: AuditConfig) -> dict[str, Any]:
         _write_orphan_csv(meta_dir / "orphan_transcripts.csv", orphan_transcripts, id_to_file, channel_dir)
         _write_duplicate_csv(meta_dir / "duplicate_transcripts.csv", duplicate_file_ids, channel_dir)
 
-    _print_console_summary(
-        report=report,
-        missing_rows=missing_rows,
-        max_rows=max(1, config.max_rows_in_console),
-    )
+    if config.print_summary:
+        _print_console_summary(
+            report=report,
+            missing_rows=missing_rows,
+            max_rows=max(1, config.max_rows_in_console),
+        )
     return report
 
 

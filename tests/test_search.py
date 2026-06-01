@@ -1,6 +1,8 @@
 import csv
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from transcriptex.search import SearchConfig, search_channel_output
@@ -73,6 +75,28 @@ class SearchTests(unittest.TestCase):
                     print_results=False,
                 )
             )
+            self.assertEqual(report["total_matches"], 1)
+
+    def test_search_print_summary_false_silent(self) -> None:
+        """print_summary=False must silence the human summary table
+        even when print_results=True."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            channel_dir = self._prepare_fixture(Path(tmp_dir))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                report = search_channel_output(
+                    SearchConfig(
+                        channel_dir=channel_dir,
+                        query="quijote",
+                        fields=["title"],
+                        statuses=[],
+                        top=5,
+                        print_results=True,
+                        print_summary=False,
+                    )
+                )
+            output = buf.getvalue()
+            self.assertNotIn("Search summary", output)
             self.assertEqual(report["total_matches"], 1)
 
     def _prepare_fixture(self, root: Path) -> Path:

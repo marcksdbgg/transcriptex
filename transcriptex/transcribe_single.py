@@ -30,12 +30,15 @@ class TranscribeSingleConfig:
     language: str
     beam_size: int
     verbose: bool
+    cookies: str = ""
+    quiet: bool = False
+    print_summary: bool = True
 
 
 class SingleTranscriber:
     def __init__(self, config: TranscribeSingleConfig):
         self.config = config
-        self.client = YouTubeClient(verbose=config.verbose)
+        self.client = YouTubeClient(verbose=config.verbose, cookies=config.cookies)
         self.engine = ASREngine(
             model_size=config.model,
             device=config.device,
@@ -116,28 +119,31 @@ class SingleTranscriber:
             "vtt":  "VTT  — WebVTT subtitles",
             "json": "JSON — full segment data (start/end/text)",
         }
-        print("=================================================================")
-        print("  Single Transcription")
-        print("=================================================================")
-        print(f"  Input   : {self.config.input_path}")
-        print(f"  Model   : {self.config.model}")
-        print(f"  Device  : {self.config.device} ({self.config.compute_type})")
-        print(f"  Format  : {fmt_labels.get(fmt, fmt.upper())}")
-        print(f"  Output  : {self.config.output_dir}")
-        print("="*65)
-        print("  Formats: --format txt | srt | vtt | json")
-        print("=================================================================")
-        print()
+        quiet = self.config.quiet
+        if not quiet:
+            print("=================================================================")
+            print("  Single Transcription")
+            print("=================================================================")
+            print(f"  Input   : {self.config.input_path}")
+            print(f"  Model   : {self.config.model}")
+            print(f"  Device  : {self.config.device} ({self.config.compute_type})")
+            print(f"  Format  : {fmt_labels.get(fmt, fmt.upper())}")
+            print(f"  Output  : {self.config.output_dir}")
+            print("="*65)
+            print("  Formats: --format txt | srt | vtt | json")
+            print("=================================================================")
+            print()
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         is_url = self.config.input_path.startswith("http://") or self.config.input_path.startswith("https://")
-        
+
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_path = None
-            
+
             try:
                 if is_url:
-                    print(f"  ↓ Downloading audio from URL...")
+                    if not quiet:
+                        print(f"  ↓ Downloading audio from URL...")
                     start_dw = time.time()
                     try:
                         audio_path = self.client.download_audio(
@@ -145,28 +151,33 @@ class SingleTranscriber:
                             tmp_dir=Path(temp_dir),
                         )
                         dw_time = time.time() - start_dw
-                        print(f"    ✓ Downloaded in {dw_time:.1f}s")
+                        if not quiet:
+                            print(f"    ✓ Downloaded in {dw_time:.1f}s")
                     except Exception as e:
-                        print(f"    ✗ Download failed: {e}")
+                        if not quiet:
+                            print(f"    ✗ Download failed: {e}")
                         return {"success": False, "error": str(e)}
                 else:
                     audio_path = Path(self.config.input_path)
                     if not audio_path.exists():
-                        print(f"  ✗ Local file not found: {audio_path}")
+                        if not quiet:
+                            print(f"  ✗ Local file not found: {audio_path}")
                         return {"success": False, "error": "File not found"}
 
-                print(f"  🎙 Transcribing...")
+                if not quiet:
+                    print(f"  🎙 Transcribing...")
                 start_tr = time.time()
                 segments_gen, info = self.engine.transcribe(
                     str(audio_path),
                     beam_size=self.config.beam_size,
                     language=self.config.language if self.config.language else None,
                 )
-                
+
                 segments = list(segments_gen)
                 tr_time = time.time() - start_tr
-                print(f"    ✓ Transcribed in {tr_time:.1f}s (Detected language: {info.language})")
-                
+                if not quiet:
+                    print(f"    ✓ Transcribed in {tr_time:.1f}s (Detected language: {info.language})")
+
             finally:
                 pass # Temp file cleans up automatically
 
@@ -176,9 +187,9 @@ class SingleTranscriber:
             base_name = Path(self.config.input_path).stem
         else:
             base_name = f"transcript_{int(time.time())}"
-            
+
         out_file = self.config.output_dir / f"{base_name}.{self.config.output_format.lower()}"
-        
+
         fmt = self.config.output_format.lower()
         if fmt == "srt":
             self._write_srt(segments, out_file)
@@ -188,14 +199,16 @@ class SingleTranscriber:
             self._write_json(segments, out_file)
         else:
             self._write_txt(segments, out_file)
-            
-        print(f"  ✓ Saved to: {out_file}")
-        
+
+        if self.config.print_summary and not quiet:
+            print(f"  ✓ Saved to: {out_file}")
+
         return {
             "success": True,
             "output_file": str(out_file),
             "language": info.language,
             "segments": len(segments),
+            "duration_seconds": getattr(info, "duration", None),
         }
 
 def run_transcribe_single(config: TranscribeSingleConfig) -> dict[str, Any]:

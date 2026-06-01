@@ -1,6 +1,8 @@
 import csv
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from transcriptex.audit import AuditConfig, audit_channel_output
@@ -116,6 +118,50 @@ class AuditTests(unittest.TestCase):
             self.assertFalse(legacy.exists())
             renamed_matches = [p for p in channel_dir.glob("*.txt") if "[abc123XYZ_9]" in p.name]
             self.assertTrue(renamed_matches)
+
+    def test_audit_print_summary_false_silent(self) -> None:
+        """When print_summary=False (e.g. --json or --quiet), the human
+        summary must NOT be printed to stdout."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            channel_dir = Path(tmp_dir) / "My Channel"
+            meta_dir = channel_dir / "_meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            rows = [
+                {
+                    "video_id": "abc123XYZ_9",
+                    "title": "Video",
+                    "url": "https://youtube.com/watch?v=abc123XYZ_9",
+                    "assigned_playlist_id": "",
+                    "assigned_playlist_title": "",
+                    "all_playlist_ids": "",
+                    "all_playlist_titles": "",
+                    "folder": "Sin_Playlist",
+                    "transcript_path": "",
+                    "status": "no_subtitles",
+                    "language": "",
+                    "source": "",
+                    "error": "No subtitle tracks found",
+                }
+            ]
+            with (meta_dir / "video_index.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                report = audit_channel_output(
+                    AuditConfig(
+                        channel_dir=channel_dir,
+                        write_files=False,
+                        max_rows_in_console=1,
+                        print_summary=False,
+                    )
+                )
+            output = buf.getvalue()
+            self.assertNotIn("Audit summary", output)
+            self.assertEqual(report["total_indexed_videos"], 1)
 
 
 if __name__ == "__main__":
