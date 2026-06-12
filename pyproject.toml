@@ -10,11 +10,16 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "yt-dlp>=2026.2.4",
+  "yt-dlp-ejs>=0.8.0",
 ]
 
 [project.optional-dependencies]
 asr = [
+  "torch>=2.1.0",
   "faster-whisper>=1.1.0",
+  "sounddevice>=0.4.6",
+  "pyaudiowpatch>=0.2.12",
+  "numpy>=1.24.0",
 ]
 
 [project.scripts]

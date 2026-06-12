@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from transcriptex.models import ChannelInfo, PlaylistRecord, VideoRecord
+from transcriptex.yt_dlp_utils import apply_youtube_ejs_opts, audio_format_selector
 from transcriptex.url_utils import (
     channel_tab_url,
     extract_playlist_id,
@@ -22,12 +22,11 @@ PLAYLIST_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _require_yt_dlp():
-    try:
-        import yt_dlp  # type: ignore
-    except Exception as exc:  # pragma: no cover - import path only
-        raise RuntimeError(
-            "yt-dlp is not installed. Run: pip install -r requirements.txt"
-        ) from exc
+    from transcriptex.yt_dlp_utils import ensure_yt_dlp_ejs
+
+    ensure_yt_dlp_ejs()
+    import yt_dlp  # type: ignore
+
     return yt_dlp
 
 
@@ -56,7 +55,7 @@ class YouTubeClient:
         }
         if self.cookies:
             options["cookiefile"] = self.cookies
-        return options
+        return apply_youtube_ejs_opts(options)
 
     def extract_info(self, url: str, flat: bool, ignoreerrors: bool = True) -> dict[str, Any]:
         yt_dlp = _require_yt_dlp()
@@ -183,11 +182,11 @@ class YouTubeClient:
         yt_dlp = _require_yt_dlp()
         output_template = str(tmp_dir / f"{out_name}.%(ext)s")
 
-        ydl_opts: dict[str, Any] = {
+        ydl_opts: dict[str, Any] = apply_youtube_ejs_opts({
             "quiet": not self.verbose,
             "no_warnings": not self.verbose,
             "noprogress": not self.verbose,
-            "format": "bestaudio/best",
+            "format": audio_format_selector(),
             "outtmpl": output_template,
             "postprocessors": [
                 {
@@ -197,7 +196,9 @@ class YouTubeClient:
                 }
             ],
             "ignoreerrors": False,
-        }
+        })
+        if self.cookies:
+            ydl_opts["cookiefile"] = self.cookies
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)

@@ -44,6 +44,7 @@ ASR_COMMAND = "asr"
 TRANSCRIBE_COMMAND = "transcribe"
 REALTIME_COMMAND = "realtime"
 SCAN_COMMAND = "scan"
+COOKIES_COMMAND = "cookies"
 
 KNOWN_SUBCOMMANDS = {
     RUN_COMMAND,
@@ -53,6 +54,7 @@ KNOWN_SUBCOMMANDS = {
     TRANSCRIBE_COMMAND,
     REALTIME_COMMAND,
     SCAN_COMMAND,
+    COOKIES_COMMAND,
 }
 
 # Subcommands that produce a structured report and accept --json / --quiet.
@@ -76,7 +78,8 @@ EXIT_WARNINGS = 2
 COOKIES_HELP = (
     "Path to a cookies.txt file (Netscape format) for authenticated "
     "indexing/downloading of members-only, age-restricted, or private "
-    "videos. Empty = no cookies."
+    "videos. If not provided, transcriptex will use stored cookies from "
+    "'transcriptex cookies'. Empty = no cookies."
 )
 
 QUIET_HELP = (
@@ -101,10 +104,11 @@ TOP_DESCRIPTION = (
 
 TOP_EPILOG = (
     "Quick start:\n"
+    "  transcriptex cookies\n"
     "  transcriptex run \"https://www.youtube.com/@channel\" -o ./output\n"
     "  transcriptex scan \"output/My Channel\" --no-interactive\n"
     "  transcriptex search \"output/My Channel\" \"keyword\"\n"
-    "  transcriptex asr \"output/My Channel\" --device cuda\n"
+    "  transcriptex asr \"output/My Channel\" --device cuda --language es --include-failed\n"
     "  transcriptex transcribe video.mp4 --format srt\n"
     "\n"
     "Subcommands:\n"
@@ -115,6 +119,7 @@ TOP_EPILOG = (
     "  asr         Transcribe 'no_subtitles' videos locally with Whisper (GPU).\n"
     "  transcribe  Transcribe a single local file or YouTube URL with Whisper.\n"
     "  realtime    Live transcription of system audio (Windows WASAPI loopback).\n"
+    "  cookies     Set up or manage YouTube cookies for authenticated downloads.\n"
     "\n"
     "Environment variables:\n"
     "  PYTHONIOENCODING=utf-8     Force UTF-8 stdout (recommended on Windows).\n"
@@ -169,15 +174,22 @@ EPILOG_SEARCH = (
 
 EPILOG_ASR = (
     "Examples:\n"
-    "  transcriptex asr \"output/My Channel\"\n"
-    "  transcriptex asr \"output/My Channel\" --model medium --device cuda --language es\n"
-    "  transcriptex asr \"output/My Channel\" --include-failed --limit 50\n"
-    "  transcriptex asr \"output/My Channel\" --cookies cookies.txt\n"
+    "  transcriptex asr \"output/My Channel\" --device cuda --language es\n"
+    "  transcriptex asr \"output/My Channel\" --batch-size 16        # faster on GPU\n"
+    "  transcriptex asr \"output/My Channel\" --include-failed --cookies cookies.txt\n"
+    "\n"
+    "Speed & rate limits:\n"
+    "  - Batched GPU inference + compressed audio (no WAV) = much faster.\n"
+    "  - Public videos download WITHOUT cookies on purpose: account cookies\n"
+    "    make YouTube rate-limit/ban far more aggressively. Use --cookies or\n"
+    "    --include-failed only for private/members content.\n"
+    "  - On rate limit the run backs off, then stops cleanly. Re-run the same\n"
+    "    command later to resume (already-done videos are skipped).\n"
     "\n"
     "Exit codes:\n"
     "  0  every targeted video processed successfully\n"
     "  1  fatal error (no _meta/video_index.csv found)\n"
-    "  2  one or more videos failed (see video_index.csv error column)"
+    "  2  one or more videos failed, or run stopped/interrupted (progress saved)"
 )
 
 EPILOG_TRANSCRIBE = (
@@ -462,7 +474,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Read _meta/video_index.csv, download audio for every video with "
             "status='no_subtitles' (or 'failed' with --include-failed), transcribe "
             "them locally with faster-whisper, and write .txt files. The CSV is "
-            "updated incrementally after each video (crash-safe and resumable)."
+            "updated incrementally after each video (crash-safe and resumable). "
+            "Re-running the same command skips completed transcripts automatically. "
+            "Writes _meta/asr_progress.json during long batches."
         ),
         epilog=EPILOG_ASR,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -500,14 +514,17 @@ def build_parser() -> argparse.ArgumentParser:
     asr_parser.add_argument(
         "--beam-size",
         type=int,
-        default=5,
-        help="Beam search size — higher = better quality, slower (default: 5).",
+        default=1,
+        help=(
+            "Beam search size. 1 (default) is fastest and works great with "
+            "large-v3-turbo; raise to 5 only if you need max quality."
+        ),
     )
     asr_parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Audio chunk batch size (default: 8).",
+        default=16,
+        help="Batched-inference chunk size on GPU — higher = faster (default: 16).",
     )
     asr_parser.add_argument(
         "--force",
@@ -523,8 +540,37 @@ def build_parser() -> argparse.ArgumentParser:
     asr_parser.add_argument(
         "--sleep",
         type=float,
-        default=0.0,
-        help="Sleep seconds between videos (default: 0).",
+        default=2.0,
+        help=(
+            "Seconds to wait between videos. Small values keep it fast; "
+            "raise to 5-10 only if you hit rate limits (default: 2)."
+        ),
+    )
+    asr_parser.add_argument(
+        "--rate-limit-wait",
+        type=float,
+        default=60.0,
+        help=(
+            "Base backoff (seconds) when YouTube rate-limits the session. "
+            "Doubles on each retry, then the run aborts cleanly so you can "
+            "resume later (default: 60)."
+        ),
+    )
+    asr_parser.add_argument(
+        "--max-rate-limit-waits",
+        type=int,
+        default=3,
+        help="Backoff retries before aborting the run on persistent rate limits (default: 3).",
+    )
+    asr_parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help=(
+            "Retry attempts per video when transcription fails transiently "
+            "(GPU OOM, etc.). On OOM, reloads the model with int8_float16 once "
+            "(default: 2)."
+        ),
     )
     asr_parser.add_argument(
         "--include-failed",
@@ -726,6 +772,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_report_flags(scan_parser)
 
+    # --- cookies -----------------------------------------------------------
+    cookies_parser = subparsers.add_parser(
+        COOKIES_COMMAND,
+        help="Set up or manage YouTube cookies for authenticated downloads.",
+        description=(
+            "Extract YouTube cookies from your browser using yt-dlp's built-in "
+            "cookie extraction. Cookies are saved persistently and used automatically "
+            "by all subcommands that download from YouTube."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  transcriptex cookies\n"
+            "  transcriptex cookies --status\n"
+            "  transcriptex cookies --remove\n"
+            "\n"
+            "Exit codes:\n"
+            "  0  cookies configured successfully\n"
+            "  1  fatal error (no browsers found, extraction failed)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cookies_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show current cookie configuration and exit.",
+    )
+    cookies_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="Delete stored cookies.",
+    )
+
     return parser
 
 
@@ -733,6 +811,21 @@ def _add_report_flags(parser: argparse.ArgumentParser) -> None:
     """Attach --quiet and --json flags to a reporting subcommand."""
     parser.add_argument("--quiet", action="store_true", help=QUIET_HELP)
     parser.add_argument("--json", action="store_true", help=JSON_HELP)
+
+
+def _resolve_cookies(explicit: str) -> str:
+    """
+    Return the cookies file path to use.
+
+    If the user passed an explicit ``--cookies`` path, use that.
+    Otherwise fall back to stored cookies from ``transcriptex cookies``.
+    """
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit
+    from transcriptex.cookies import get_cookies_file
+
+    return get_cookies_file()
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +877,7 @@ def _run_export(args: argparse.Namespace) -> int:
         verbose=bool(args.verbose),
         timeout=max(5, args.timeout),
         sleep_seconds=max(0.0, args.sleep),
-        cookies=str(getattr(args, "cookies", "") or ""),
+        cookies=_resolve_cookies(str(getattr(args, "cookies", "") or "")),
     )
 
     transcriber = ChannelTranscriber(config)
@@ -872,6 +965,16 @@ def _run_search(args: argparse.Namespace) -> int:
 def _run_asr(args: argparse.Namespace) -> int:
     from transcriptex.asr import AsrConfig, run_asr
 
+    # Only attach cookies when truly needed. Sending account cookies for bulk
+    # public downloads ties every request to your Google account, which makes
+    # YouTube rate-limit (and potentially ban) far more aggressively. Private
+    # videos (--include-failed) or an explicit --cookies path still use them.
+    explicit_cookies = str(getattr(args, "cookies", "") or "").strip()
+    if explicit_cookies or bool(args.include_failed):
+        cookies = _resolve_cookies(explicit_cookies)
+    else:
+        cookies = ""
+
     config = AsrConfig(
         channel_dir=Path(args.channel_dir),
         model=args.model,
@@ -885,9 +988,13 @@ def _run_asr(args: argparse.Namespace) -> int:
         sleep_seconds=max(0.0, float(args.sleep)),
         include_failed=bool(args.include_failed),
         verbose=bool(args.verbose),
-        cookies=str(getattr(args, "cookies", "") or ""),
+        cookies=cookies,
         quiet=bool(getattr(args, "quiet", False)),
         print_summary=_should_print_summary(args),
+        retries=max(1, int(getattr(args, "retries", 2))),
+        rate_limit_wait_seconds=max(10.0, float(getattr(args, "rate_limit_wait", 60.0))),
+        max_rate_limit_waits=max(1, int(getattr(args, "max_rate_limit_waits", 3))),
+        yt_sleep_interval=0.0,
     )
     try:
         report = run_asr(config)
@@ -895,12 +1002,16 @@ def _run_asr(args: argparse.Namespace) -> int:
         print(f"Fatal error: {exc}", file=sys.stderr)
         return _emit_error_and_return(args, exc, command=ASR_COMMAND)
 
+    interrupted = bool(report.get("interrupted"))
+    has_errors = report.get("errors", 0) > 0
+    exit_code = EXIT_WARNINGS if (has_errors or interrupted) else EXIT_OK
+
     return _emit_report(
         args,
         command=ASR_COMMAND,
         report=report,
         human_formatter=None,  # asr prints its own summary
-        exit_code=EXIT_WARNINGS if report.get("errors", 0) > 0 else EXIT_OK,
+        exit_code=exit_code,
     )
 
 
@@ -920,11 +1031,10 @@ def _run_transcribe_single(args: argparse.Namespace) -> int:
     device = args.device
     compute_type = args.compute_type
     if device == "auto" or compute_type == "auto":
-        try:
-            import torch
-            gpu_available = torch.cuda.is_available()
-        except ImportError:
-            gpu_available = False
+        from transcriptex.dependency_manager import ensure_torch
+        ensure_torch()
+        import torch
+        gpu_available = torch.cuda.is_available()
         if device == "auto":
             device = "cuda" if gpu_available else "cpu"
         if compute_type == "auto":
@@ -940,7 +1050,7 @@ def _run_transcribe_single(args: argparse.Namespace) -> int:
         language=args.language,
         beam_size=max(1, int(args.beam_size)),
         verbose=bool(args.verbose),
-        cookies=str(getattr(args, "cookies", "") or ""),
+        cookies=_resolve_cookies(str(getattr(args, "cookies", "") or "")),
         quiet=bool(getattr(args, "quiet", False)),
         print_summary=_should_print_summary(args),
     )
@@ -986,7 +1096,7 @@ def _run_scan(args: argparse.Namespace) -> int:
     config = ScanConfig(
         channel_url_or_dir=str(args.channel_url_or_dir),
         output_dir=Path(args.output).resolve(),
-        cookies=str(getattr(args, "cookies", "") or ""),
+        cookies=_resolve_cookies(str(getattr(args, "cookies", "") or "")),
         no_interactive=bool(args.no_interactive),
         page_size=max(1, int(args.page_size)),
         print_summary=_should_print_summary(args),
@@ -1006,6 +1116,33 @@ def _run_scan(args: argparse.Namespace) -> int:
     )
 
 
+def _run_cookies(args: argparse.Namespace) -> int:
+    from transcriptex.cookies import (
+        remove_stored_cookies,
+        run_interactive_setup,
+        show_cookie_status,
+    )
+
+    if getattr(args, "status", False):
+        show_cookie_status()
+        return EXIT_OK
+
+    if getattr(args, "remove", False):
+        if remove_stored_cookies():
+            print("  Stored cookies removed.")
+        else:
+            print("  No stored cookies found.")
+        return EXIT_OK
+
+    try:
+        run_interactive_setup()
+    except Exception as exc:
+        print(f"Fatal error: {exc}", file=sys.stderr)
+        return EXIT_FATAL
+
+    return EXIT_OK
+
+
 # Populate dispatch table at module import.
 _DISPATCH.update({
     RUN_COMMAND: _run_export,
@@ -1015,6 +1152,7 @@ _DISPATCH.update({
     TRANSCRIBE_COMMAND: _run_transcribe_single,
     REALTIME_COMMAND: _run_realtime,
     SCAN_COMMAND: _run_scan,
+    COOKIES_COMMAND: _run_cookies,
 })
 
 

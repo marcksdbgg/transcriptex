@@ -253,6 +253,30 @@ transcriptex asr "output/My Channel" \
   --limit 50
 ```
 
+#### Current channel state and resume path
+
+As of 2026-06-01, the `Jesús G. Maestro` channel is in this state:
+
+- 1,988 videos indexed.
+- 798 transcripts already existing on disk.
+- 94 videos transcribed from YouTube subtitles during the last `run` pass.
+- 1,050 videos still marked `no_subtitles` and ready for ASR fallback.
+- 46 videos marked `failed` because YouTube returned private/locked metadata.
+
+To resume the paused ASR batch, run the same command again:
+
+```bash
+transcriptex asr "output/Jesús G. Maestro"
+```
+
+The command is resumable: it reads `_meta/video_index.csv`, skips videos that already have a transcript file, and only processes rows still marked `no_subtitles` unless you add `--include-failed`.
+
+To retry the private/locked videos as well, use cookies:
+
+```bash
+transcriptex asr "output/Jesús G. Maestro" --include-failed --cookies cookies.txt
+```
+
 ---
 
 ### 4. `realtime` — Live System Audio Transcription
@@ -415,6 +439,8 @@ Generated at: 2026-02-24T10:00:00+00:00
 - **No API key required.** The tool uses `yt-dlp` to extract metadata and subtitle URLs anonymously.
 - **The `run` command never downloads audio.** Only subtitle track bytes are fetched. Use `asr` or `transcribe` for audio-based transcription.
 - **ffmpeg is required** for the `asr` and `transcribe` commands (audio extraction). Install it and add it to your PATH.
+- **ASR is resumable.** Re-running `transcriptex asr` continues from `_meta/video_index.csv` and skips transcript files that already exist on disk.
+- **Private videos need auth.** Rows marked `failed` usually need `--include-failed` plus `--cookies` or browser-exported cookies.
 - **CUDA fallback:** If CUDA is unavailable, `ASREngine` automatically switches to `cpu` with `int8` quantization.
 - **Windows environments:** Set `HF_HUB_DISABLE_SYMLINKS=1` (already applied in `asr.py`) to avoid permission errors when downloading Whisper model weights as a non-admin user.
 - **Restricted videos** (private, members-only, region-blocked) will fail gracefully and be logged in `video_index.csv`.

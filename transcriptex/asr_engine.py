@@ -32,11 +32,11 @@ class ASREngine:
             return
 
         gpu_available = False
-        try:
+        if self.device == "auto" or (self.compute_type == "auto" and self.device in ("auto", "cuda")):
+            from transcriptex.dependency_manager import ensure_torch
+            ensure_torch()
             import torch
             gpu_available = torch.cuda.is_available()
-        except ImportError:
-            pass
 
         if self.device == "auto":
             self.device = "cuda" if gpu_available else "cpu"
@@ -47,28 +47,18 @@ class ASREngine:
         if self.model is not None:
             return self.model
 
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise RuntimeError(
-                "faster-whisper is not installed.\n"
-                "Run: pip install faster-whisper\n"
-                "For GPU support also install: pip install torch --index-url https://download.pytorch.org/whl/cu121"
-            ) from exc
+        from transcriptex.dependency_manager import ensure_faster_whisper
+        ensure_faster_whisper()
+        from faster_whisper import WhisperModel
 
-        # Resolve auto values first
+        # Resolve auto values first (this will install torch if needed)
         self._resolve_device_and_compute()
 
         # If CUDA was explicitly requested but is not available, fall back gracefully
         if self.device == "cuda":
-            try:
-                import torch
-                if not torch.cuda.is_available():
-                    print("  [WARN] CUDA unavailable. Falling back to CPU (int8).")
-                    self.device = "cpu"
-                    self.compute_type = "int8"
-            except ImportError:
-                print("  [WARN] PyTorch not installed. Falling back to CPU (int8).")
+            import torch
+            if not torch.cuda.is_available():
+                print("  [WARN] CUDA unavailable. Falling back to CPU (int8).")
                 self.device = "cpu"
                 self.compute_type = "int8"
 

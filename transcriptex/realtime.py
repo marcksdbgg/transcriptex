@@ -44,11 +44,22 @@ class RealtimeTranscriber:
         
     def _init_whisper(self):
         print(f"  [ASR] Initializing faster-whisper ({self.config.model})...")
+        from transcriptex.dependency_manager import ensure_faster_whisper, ensure_torch
+        ensure_faster_whisper()
         from faster_whisper import WhisperModel
-        
+
         device = self.config.device
         compute_type = self.config.compute_type
-        
+
+        # Ensure torch is available when CUDA is requested so we can probe it
+        if device == "cuda":
+            ensure_torch()
+            import torch
+            if not torch.cuda.is_available():
+                print("  [WARN] CUDA unavailable. Falling back to CPU (int8).")
+                device = "cpu"
+                compute_type = "int8"
+
         try:
             model = WhisperModel(
                 self.config.model,
@@ -57,7 +68,7 @@ class RealtimeTranscriber:
             )
             return model
         except Exception as e:
-            if device == "cuda" and ("cublas" in str(e).lower() or "cuda" in str(e).lower()):
+            if device == "cuda" and ("cublas" in str(e).lower() or "cuda" in str(e).lower() or "gpu" in str(e).lower()):
                 print(f"  [WARN] CUDA libraries not available ({e})")
                 print("  [WARN] Falling back to CPU (int8). Install CUDA toolkit for GPU support.")
                 print("         Download from: https://developer.nvidia.com/cuda-downloads")
@@ -70,6 +81,9 @@ class RealtimeTranscriber:
             raise
 
     def _list_devices(self):
+        from transcriptex.dependency_manager import ensure_pyaudiowpatch, ensure_numpy
+        ensure_pyaudiowpatch()
+        ensure_numpy()
         import pyaudiowpatch as pa
         p = pa.PyAudio()
         print("=== WASAPI Loopback Devices ===\n")
@@ -79,6 +93,9 @@ class RealtimeTranscriber:
         p.terminate()
 
     def _get_wasapi_loopback(self, device_index: int = -1):
+        from transcriptex.dependency_manager import ensure_pyaudiowpatch, ensure_numpy
+        ensure_pyaudiowpatch()
+        ensure_numpy()
         import pyaudiowpatch as pa
         p = pa.PyAudio()
         try:
@@ -378,12 +395,10 @@ class RealtimeTranscriber:
 
 
     def _run_wasapi_loop(self) -> dict:
-
-        try:
-            import pyaudiowpatch as pa
-        except ImportError:
-            print("  [ERR] pyaudiowpatch not installed. Run: pip install pyaudiowpatch numpy")
-            return {"success": False, "error": "Missing dependencies"}
+        from transcriptex.dependency_manager import ensure_pyaudiowpatch, ensure_numpy
+        ensure_pyaudiowpatch()
+        ensure_numpy()
+        import pyaudiowpatch as pa
 
         p, loopback_device = self._get_wasapi_loopback(self.config.device_index)
         

@@ -70,8 +70,8 @@ def _read_index(meta_dir: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _make_mock_model(text: str = "Texto transcrito de prueba.", lang: str = "es") -> MagicMock:
-    """Return a mock faster-whisper WhisperModel that yields one segment."""
+def _make_mock_model(text: str = "Texto transcrito de prueba.", lang: str = "es") -> dict:
+    """Return a mock engine dict (matches _load_model's return shape)."""
     segment = MagicMock()
     segment.text = text
 
@@ -80,7 +80,7 @@ def _make_mock_model(text: str = "Texto transcrito de prueba.", lang: str = "es"
 
     model = MagicMock()
     model.transcribe.return_value = (iter([segment]), info)
-    return model
+    return {"model": model, "batched": None, "device": "cpu"}
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ class AsrRunTests(unittest.TestCase):
             mock_model = _make_mock_model("Texto transcrito de prueba.", "es")
             mock_load_model.return_value = mock_model
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8")
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0)
             report = run_asr(config)
 
             self.assertEqual(report["ok"], 1)
@@ -199,7 +199,7 @@ class AsrRunTests(unittest.TestCase):
     def test_asr_skips_existing_transcript_without_force(
         self, mock_download: MagicMock, mock_load_model: MagicMock
     ) -> None:
-        """Without --force, existing transcripts must not be re-downloaded."""
+        """Without --force, existing transcripts are synced to the index and skipped."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             rows = [_make_row("abc123XYZ_9", "Video Con Transcript", "no_subtitles")]
             channel_dir = self._prepare_channel(Path(tmp_dir), rows)
@@ -210,13 +210,17 @@ class AsrRunTests(unittest.TestCase):
 
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=False)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=False, sleep_seconds=0)
             report = run_asr(config)
 
-            # Download must NOT have been called
             mock_download.assert_not_called()
-            self.assertEqual(report["skipped"], 1)
-            self.assertEqual(report["ok"], 0)
+            mock_load_model.assert_not_called()
+            self.assertEqual(report.get("total_processed", 0), 0)
+
+            updated_rows = _read_index(channel_dir / "_meta")
+            row = next(r for r in updated_rows if r["video_id"] == "abc123XYZ_9")
+            self.assertEqual(row["status"], "ok")
+            self.assertNotEqual(row["transcript_path"], "")
 
     @patch("transcriptex.asr._load_model")
     @patch("transcriptex.asr._download_audio")
@@ -236,7 +240,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.return_value = fake_audio
             mock_load_model.return_value = _make_mock_model("Nuevo contenido.", "es")
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=True)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=True, sleep_seconds=0)
             report = run_asr(config)
 
             mock_download.assert_called_once()
@@ -264,7 +268,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.return_value = fake_audio
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8")
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0)
             report = run_asr(config)
 
             # Only 1 eligible video (no_subtitles)
@@ -289,7 +293,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.return_value = fake_audio
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", limit=2)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", limit=2, sleep_seconds=0)
             report = run_asr(config)
 
             self.assertEqual(report["total_processed"], 2)
@@ -314,7 +318,7 @@ class AsrRunTests(unittest.TestCase):
             mock_load_model.return_value = _make_mock_model()
 
             config = AsrConfig(
-                channel_dir=channel_dir, device="cpu", compute_type="int8", include_failed=True
+                channel_dir=channel_dir, device="cpu", compute_type="int8", include_failed=True, sleep_seconds=0
             )
             report = run_asr(config)
 
@@ -334,7 +338,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.side_effect = RuntimeError("Video unavailable")
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8")
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0)
             report = run_asr(config)
 
             self.assertEqual(report["errors"], 1)
@@ -367,11 +371,14 @@ class AsrCliTests(unittest.TestCase):
         self.assertEqual(args.device, "cuda")
         self.assertEqual(args.compute_type, "float16")
         self.assertEqual(args.language, "es")
-        self.assertEqual(args.beam_size, 5)
-        self.assertEqual(args.batch_size, 8)
+        self.assertEqual(args.beam_size, 1)
+        self.assertEqual(args.batch_size, 16)
         self.assertFalse(args.force)
         self.assertEqual(args.limit, 0)
-        self.assertEqual(args.sleep, 0.0)
+        self.assertEqual(args.sleep, 2.0)
+        self.assertEqual(args.rate_limit_wait, 60.0)
+        self.assertEqual(args.max_rate_limit_waits, 3)
+        self.assertEqual(args.retries, 2)
         self.assertFalse(args.include_failed)
         self.assertFalse(args.verbose)
 

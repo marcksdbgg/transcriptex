@@ -28,6 +28,22 @@ No linter, formatter, typechecker, or CI is configured.
 
 7 ASR tests fail with `UnicodeEncodeError` on Windows. Root cause: `asr.py` prints Unicode chars (`\u25b6`, `\u2713`) but `cli.py:310-314` reconfigures stdout to UTF-8 only inside `main()`. Tests call `run_asr()` directly, bypassing that fix. To fix: either reconfigure stdout at module level in `asr.py`, or have tests set `PYTHONIOENCODING=utf-8`.
 
+## Auto-Installation of Heavy Dependencies
+
+`transcriptex/dependency_manager.py` provides `ensure_*` helpers that install missing
+packages **into the current interpreter** (usually `.venv/`) via `subprocess` + `pip`.
+
+- `faster-whisper` and `torch` are installed on-demand when `asr`, `transcribe`, or `realtime` run.
+- `torch` is automatically fetched from the **CUDA 12.1** wheel index when an NVIDIA GPU is detected,
+  otherwise from the **CPU** wheel index — no multi-gigabyte CUDA download unless the hardware
+  justifies it.
+- `pyaudiowpatch` and `numpy` are installed on-demand for `realtime`.
+- `yt-dlp` and `yt-dlp-ejs` are core dependencies; `dependency_manager` guards them too.
+- YouTube downloads (ASR audio, `run` metadata) require **Node.js, Deno, or Bun on PATH** for yt-dlp's EJS challenge solver (since yt-dlp 2025.11). Without it, downloads fail with *"Requested format is not available"*.
+
+This means the CLI no longer crashes with *"faster-whisper is not installed"* or
+*"torch not installed"*; it prompts for installation and continues.
+
 ## Architecture
 
 Single package `transcriptex/` with 6 CLI subcommands dispatched from `cli.py`:
@@ -45,6 +61,7 @@ Single package `transcriptex/` with 6 CLI subcommands dispatched from `cli.py`:
 - All heavy imports (`faster_whisper`, `torch`, `sounddevice`, `pyaudiowpatch`) are **lazy** — only loaded when their subcommand runs.
 - `asr.py` saves `video_index.csv` incrementally after each video — crash-safe and resumable.
 - `cli.py` has backward compat: if first arg is not a known subcommand, it assumes `run`.
+- `dependency_manager.py`: auto-installs missing heavy deps (`torch`, `faster-whisper`, `pyaudiowpatch`, `numpy`, `yt-dlp`) into the running interpreter on first use.
 
 ## Conventions
 
