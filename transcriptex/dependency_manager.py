@@ -9,11 +9,22 @@ transcriptex (usually ``.venv\\Scripts\\python.exe`` on Windows).
 from __future__ import annotations
 
 import importlib
+import csv
+import os
+import platform
 import shutil
 import subprocess
 import sys
 import ctypes
+from pathlib import Path
 from typing import Iterable
+
+_NVIDIA_CUDA_PACKAGES = (
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+)
+_CUDA_DLL_DIRS_PREPENDED = False
 
 
 def _has_nvidia_gpu() -> bool:
@@ -26,6 +37,96 @@ def _has_nvidia_gpu() -> bool:
             return False
     # Linux / macOS
     return shutil.which("nvidia-smi") is not None
+
+
+def _nvidia_site_package_dirs() -> list[Path]:
+    """Return nvidia/*/bin (Windows) or nvidia/*/lib (Linux) paths from site-packages."""
+    lib_subdir = "bin" if platform.system() == "Windows" else "lib"
+    paths: list[Path] = []
+    seen: set[Path] = set()
+
+    for site_dir in {Path(p) for p in sys.path if p}:
+        nvidia_root = site_dir / "nvidia"
+        if not nvidia_root.is_dir():
+            continue
+        for pkg_dir in sorted(nvidia_root.iterdir()):
+            lib_dir = pkg_dir / lib_subdir
+            if lib_dir.is_dir() and lib_dir not in seen:
+                seen.add(lib_dir)
+                paths.append(lib_dir)
+
+    return paths
+
+
+def prepend_nvidia_cuda_paths() -> None:
+    """
+    Expose NVIDIA pip runtime DLLs to CTranslate2 on Windows.
+
+    CTranslate2 loads cublas/cudnn via native LoadLibrary, which does not
+    always honor os.add_dll_directory(). Prepending PATH is required.
+    """
+    global _CUDA_DLL_DIRS_PREPENDED
+    if _CUDA_DLL_DIRS_PREPENDED:
+        return
+
+    paths = _nvidia_site_package_dirs()
+    if not paths:
+        return
+
+    path_prefix = os.pathsep.join(str(p) for p in paths)
+    os.environ["PATH"] = path_prefix + os.pathsep + os.environ.get("PATH", "")
+
+    if sys.platform == "win32":
+        for lib_dir in paths:
+            try:
+                os.add_dll_directory(str(lib_dir))
+            except (OSError, AttributeError):
+                pass
+
+    _CUDA_DLL_DIRS_PREPENDED = True
+
+
+def ensure_nvidia_cuda_runtime() -> None:
+    """Install CUDA 12 runtime wheels when a GPU is present."""
+    if not _has_nvidia_gpu():
+        return
+
+    if not _nvidia_site_package_dirs():
+        ensure(*_NVIDIA_CUDA_PACKAGES)
+
+    prepend_nvidia_cuda_paths()
+
+
+def cuda_available() -> bool:
+    """
+    Return True when CUDA can be used for faster-whisper inference.
+
+    faster-whisper runs on CTranslate2, not PyTorch, so we probe CT2 first.
+    This avoids false negatives when torch is installed as a CPU-only wheel
+    (common on Python versions without official CUDA torch builds).
+    """
+    if _has_nvidia_gpu():
+        try:
+            ensure_nvidia_cuda_runtime()
+            import ctranslate2
+
+            if ctranslate2.get_cuda_device_count() > 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def nvidia_gpu_info() -> tuple[str, float] | None:
+    """Read device-zero VRAM without importing or installing PyTorch."""
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
+            '--format=csv,noheader,nounits'], capture_output=True, text=True, check=True, timeout=5)
+        name, memory = next(csv.reader(result.stdout.splitlines()))
+        return name.strip(), float(memory.strip())
+    except (OSError, subprocess.SubprocessError, ValueError, StopIteration):
+        return None
 
 
 def _pip_install(
@@ -41,8 +142,8 @@ def _pip_install(
     if extra_index_url:
         cmd += ["--extra-index-url", extra_index_url]
 
-    print(f"[dep-mgr] Installing missing packages: {', '.join(packages)} ...")
-    result = subprocess.run(cmd, check=False)
+    print(f"[dep-mgr] Installing missing packages: {', '.join(packages)} ...", file=sys.stderr)
+    result = subprocess.run(cmd, check=False, stdout=sys.stderr)
     if result.returncode != 0:
         raise RuntimeError(
             f"Failed to install packages: {list(packages)}.\n"
@@ -153,6 +254,7 @@ def ensure_torch() -> None:
 
 def ensure_faster_whisper() -> None:
     """Shorthand: make sure faster-whisper is available."""
+    ensure_nvidia_cuda_runtime()
     ensure("faster_whisper:faster-whisper")
 
 

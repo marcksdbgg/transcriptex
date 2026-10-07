@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from transcriptex.models import ChannelInfo, PlaylistRecord, VideoRecord
 from transcriptex.yt_dlp_utils import apply_youtube_ejs_opts, audio_format_selector
 from transcriptex.url_utils import (
     channel_tab_url,
@@ -174,10 +175,11 @@ class YouTubeClient:
         with urlopen(request, timeout=self.timeout) as response:
             return response.read()
 
-    def download_audio(self, url: str, tmp_dir: Path, out_name: str = "audio") -> Path:
+    def download_audio(self, url: str, tmp_dir: Path, out_name: str = "audio", *, extract_wav: bool = False) -> Path:
         """
         Download best audio from a YouTube URL to tmp_dir using yt-dlp.
-        Returns the path to the downloaded audio file (.wav fallback).
+        Keep the original compressed audio: PyAV can decode it directly.
+        Request extract_wav=True only for consumers that require WAV.
         """
         yt_dlp = _require_yt_dlp()
         output_template = str(tmp_dir / f"{out_name}.%(ext)s")
@@ -188,31 +190,29 @@ class YouTubeClient:
             "noprogress": not self.verbose,
             "format": audio_format_selector(),
             "outtmpl": output_template,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "wav",
-                    "preferredquality": "0",
-                }
-            ],
+            "noplaylist": True,
+            "retries": self.retries,
+            "socket_timeout": self.timeout,
             "ignoreerrors": False,
         })
         if self.cookies:
             ydl_opts["cookiefile"] = self.cookies
+        if extract_wav:
+            ydl_opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}]
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
                 raise RuntimeError("yt-dlp returned empty metadata — video may be private or unavailable")
 
-        # Find the downloaded WAV file
-        wav_candidates = list(tmp_dir.glob("*.wav"))
+        # Scope matches to this download (never return another job's audio).
+        wav_candidates = list(tmp_dir.glob(f"{out_name}.wav"))
         if wav_candidates:
             return wav_candidates[0]
 
         # Fallback: any audio file
-        for ext in ("m4a", "webm", "opus", "mp3", "ogg", "flac"):
-            candidates = list(tmp_dir.glob(f"*.{ext}"))
+        for ext in ("m4a", "webm", "opus", "mp3", "ogg", "flac", "mp4", "aac"):
+            candidates = list(tmp_dir.glob(f"{out_name}.{ext}"))
             if candidates:
                 return candidates[0]
 

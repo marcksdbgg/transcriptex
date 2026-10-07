@@ -2,3 +2,27 @@ __pycache__/
 *.pyc
 output/
 .venv/
+
+# Local builds and test caches
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated transcripts, scratch media and test reports (keep them on disk)
+output_test/
+/_test_audio.webm
+/temp_test2.wav
+/test_results.txt
+/test_full_results.txt
+/test_scan_results.txt
+
+# Local credentials
+.env
+.env.*
+!.env.example
+cookies.txt
+*_cookies.txt
+*.cookies.txt

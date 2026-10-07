@@ -170,7 +170,7 @@ class AsrRunTests(unittest.TestCase):
             mock_model = _make_mock_model("Texto transcrito de prueba.", "es")
             mock_load_model.return_value = mock_model
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0, download_workers=1)
             report = run_asr(config)
 
             self.assertEqual(report["ok"], 1)
@@ -210,7 +210,7 @@ class AsrRunTests(unittest.TestCase):
 
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=False, sleep_seconds=0)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=False, sleep_seconds=0, download_workers=1)
             report = run_asr(config)
 
             mock_download.assert_not_called()
@@ -240,7 +240,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.return_value = fake_audio
             mock_load_model.return_value = _make_mock_model("Nuevo contenido.", "es")
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=True, sleep_seconds=0)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", force=True, sleep_seconds=0, download_workers=1)
             report = run_asr(config)
 
             mock_download.assert_called_once()
@@ -268,7 +268,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.return_value = fake_audio
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0, download_workers=1)
             report = run_asr(config)
 
             # Only 1 eligible video (no_subtitles)
@@ -293,7 +293,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.return_value = fake_audio
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", limit=2, sleep_seconds=0)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", limit=2, sleep_seconds=0, download_workers=1)
             report = run_asr(config)
 
             self.assertEqual(report["total_processed"], 2)
@@ -318,7 +318,8 @@ class AsrRunTests(unittest.TestCase):
             mock_load_model.return_value = _make_mock_model()
 
             config = AsrConfig(
-                channel_dir=channel_dir, device="cpu", compute_type="int8", include_failed=True, sleep_seconds=0
+                channel_dir=channel_dir, device="cpu", compute_type="int8",
+                include_failed=True, sleep_seconds=0, download_workers=1,
             )
             report = run_asr(config)
 
@@ -338,7 +339,7 @@ class AsrRunTests(unittest.TestCase):
             mock_download.side_effect = RuntimeError("Video unavailable")
             mock_load_model.return_value = _make_mock_model()
 
-            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0)
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0, download_workers=1)
             report = run_asr(config)
 
             self.assertEqual(report["errors"], 1)
@@ -350,6 +351,46 @@ class AsrRunTests(unittest.TestCase):
                 if "_meta" not in f.parts
             ]
             self.assertEqual(len(txt_files), 0)
+
+    @patch("transcriptex.asr._load_model")
+    @patch("transcriptex.asr._download_audio")
+    def test_asr_empty_transcript_marked_no_speech(
+        self, mock_download: MagicMock, mock_load_model: MagicMock
+    ) -> None:
+        """Music/silent videos (empty transcript) are terminal no_speech, not errors."""
+        import csv
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            rows = [_make_row("abc123XYZ_9", "Romanza sin palabras", "no_subtitles")]
+            channel_dir = self._prepare_channel(Path(tmp_dir), rows)
+
+            fake_audio = Path(tmp_dir) / "audio.m4a"
+            fake_audio.write_bytes(b"\x00\x00")
+            mock_download.return_value = fake_audio
+            # Model yields a blank segment -> empty transcript (VAD found no speech).
+            mock_load_model.return_value = _make_mock_model(text="   ")
+
+            config = AsrConfig(channel_dir=channel_dir, device="cpu", compute_type="int8", sleep_seconds=0, download_workers=1)
+            report = run_asr(config)
+
+            self.assertEqual(report["errors"], 0)
+            self.assertEqual(report["ok"], 0)
+            self.assertEqual(report["no_speech"], 1)
+
+            # No transcript file written
+            txt_files = [f for f in channel_dir.rglob("*.txt") if "_meta" not in f.parts]
+            self.assertEqual(len(txt_files), 0)
+
+            # Row marked terminal so it is NOT retried next run.
+            index_path = channel_dir / "_meta" / "video_index.csv"
+            with index_path.open(encoding="utf-8") as fh:
+                saved = {r["video_id"]: r for r in csv.DictReader(fh)}
+            self.assertEqual(saved["abc123XYZ_9"]["status"], "no_speech")
+
+            # Re-running skips it entirely (download not called again).
+            mock_download.reset_mock()
+            run_asr(config)
+            mock_download.assert_not_called()
 
 
 class AsrCliTests(unittest.TestCase):
@@ -378,6 +419,7 @@ class AsrCliTests(unittest.TestCase):
         self.assertEqual(args.sleep, 2.0)
         self.assertEqual(args.rate_limit_wait, 60.0)
         self.assertEqual(args.max_rate_limit_waits, 3)
+        self.assertEqual(args.download_workers, 4)
         self.assertEqual(args.retries, 2)
         self.assertFalse(args.include_failed)
         self.assertFalse(args.verbose)

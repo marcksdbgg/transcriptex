@@ -14,9 +14,12 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass, field, replace
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, replace
 from pathlib import Path
+from queue import Queue
 from typing import Any
 
 # FIX: Disable symlinks on Windows to avoid [WinError 1314] if not Admin/DevMode
@@ -58,6 +61,9 @@ STATUS_OK = "ok"
 STATUS_NO_SUBTITLES = "no_subtitles"
 STATUS_FAILED = "failed"
 STATUS_EXISTING = "existing"
+# Valid audio that contains no transcribable speech (music, silent slideshows,
+# trailers). Terminal: never retried, not an error — just nothing to transcribe.
+STATUS_NO_SPEECH = "no_speech"
 SOURCE_ASR = "asr"
 
 # Video index CSV column order (must match transcriber.py)
@@ -101,6 +107,7 @@ class AsrConfig:
     rate_limit_wait_seconds: float = 60.0  # base backoff when YouTube rate-limits (doubles each retry)
     max_rate_limit_waits: int = 3  # backoffs before aborting the run cleanly
     yt_sleep_interval: float = 0.0  # extra yt-dlp sleep between HTTP requests (0 = fastest)
+    download_workers: int = 4  # parallel download threads prefetching audio for the GPU
 
 
 # Hard cap on the rate-limit backoff so an unattended run never idles for an
@@ -117,6 +124,20 @@ class AsrResult:
     transcript_path: Path | None = None
     language: str = ""
     error: str = ""
+
+
+@dataclass
+class _PreparedVideo:
+    """Downloaded (or failed/skipped) video ready for GPU transcription."""
+
+    index: int
+    total: int
+    row: dict[str, str]
+    audio_path: Path | None = None
+    tmp_dir: tempfile.TemporaryDirectory[str] | None = None
+    error_msg: str = ""
+    skipped: bool = False
+    skip_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +254,7 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
         print(f"  Device            : {config.device} ({config.compute_type})")
         print(f"  Language           : {config.language}")
         print(f"  Beam size          : {config.beam_size}")
+        print(f"  Download workers   : {config.download_workers}")
         print("=" * 65)
         print()
 
@@ -254,203 +276,51 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
     ok_count = 0
     skip_count = 0
     err_count = 0
+    no_speech_count = 0
     wall_start = time.time()
     interrupted = False
     rate_limited = False
 
+    pipeline_state = {
+        "ok_count": 0,
+        "skip_count": 0,
+        "err_count": 0,
+        "no_speech_count": 0,
+        "processing_times": processing_times,
+        "rate_limited": False,
+    }
+    state_lock = threading.Lock()
+
     try:
-        for index, row in enumerate(eligible_rows, start=1):
-            video_id = row.get("video_id", "").strip()
-            title = row.get("title", "").strip() or video_id
-            url = row.get("url", "").strip()
-            channel = row.get("assigned_playlist_title", "").strip()
-            
-            if not video_id or not url:
-                if not quiet:
-                    print(f"  ⚠ [{index}/{total_eligible}] Skipping — missing video_id or url")
-                results.append(AsrResult(video_id=video_id, status="skipped", error="Missing video_id or url"))
-                skip_count += 1
-                continue
-            
-            # Determine target path (same folder as indexed)
-            folder_rel = row.get("folder", "").strip()
-            if folder_rel:
-                target_dir = channel_dir / folder_rel
-            else:
-                target_dir = channel_dir / "Sin_Playlist"
-            
-            transcript_name = build_transcript_filename(video_id=video_id, title=title)
-            transcript_path = target_dir / transcript_name
-            
-            # --- Process this video ---
-            short_title = (title[:45] + "...") if len(title) > 45 else title
-            
-            # Status line: header
-            if not quiet:
-                print(f"  ▶ [{index}/{total_eligible}] {short_title}")
-                print(f"    ID: {video_id}")
-            
-            t0 = time.time()
-            transcript_text = ""
-            detected_lang = ""
-            error_msg = ""
-            rate_limit_waits = 0
-
-            # Download + transcribe. On YouTube rate-limit, back off (exponential,
-            # capped) and keep retrying the SAME video so an unattended overnight
-            # run grinds through and recovers on its own once the limit clears.
-            while True:
-                try:
-                    if not quiet:
-                        print(f"    ↓ Downloading audio...", end="", flush=True)
-                    dl_start = time.time()
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        audio_path = _download_audio(
-                            url=url,
-                            tmp_dir=Path(tmp_dir),
-                            verbose=config.verbose,
-                            cookies=config.cookies,
-                            max_retries=2,
-                            sleep_base=2.0,
-                        )
-                        if not quiet:
-                            print(f" OK ({_fmt_duration(time.time() - dl_start)})")
-                            print(f"    🎙 Transcribing...", end="", flush=True)
-                        tr_start = time.time()
-                        transcript_text, detected_lang = _transcribe_audio_with_retry(
-                            audio_path=audio_path,
-                            model_holder=model_holder,
-                            config=config,
-                            quiet=quiet,
-                        )
-                        if not quiet:
-                            print(f" OK ({_fmt_duration(time.time() - tr_start)})")
-                    break  # success
-
-                except Exception as exc:
-                    if is_rate_limit_error(exc):
-                        rate_limit_waits += 1
-                        rate_limited = True
-                        # Exponential backoff capped at RATE_LIMIT_MAX_BACKOFF so we
-                        # never sit idle for an hour; retry the same video forever.
-                        exponent = min(rate_limit_waits - 1, config.max_rate_limit_waits)
-                        wait = min(
-                            config.rate_limit_wait_seconds * (2 ** exponent),
-                            RATE_LIMIT_MAX_BACKOFF,
-                        )
-                        if not quiet:
-                            print(" RATE-LIMITED")
-                            print(
-                                f"    ⏸ YouTube rate limit (retry #{rate_limit_waits}). "
-                                f"Backing off {_fmt_duration(wait)} then retrying same "
-                                f"video... (Ctrl+C to stop)"
-                            )
-                        _write_video_index(video_index_path, rows)
-                        time.sleep(wait)
-                        continue
-
-                    # Permanent / per-video failure — record and move on.
-                    error_msg = str(exc)
-                    break
-
-            # Step 3a: per-video failure path
-            if error_msg:
-                if not quiet:
-                    phase = "Transcription" if "Transcription failed" in error_msg else "Download"
-                    print(f" FAILED")
-                    print(f"    ✗ {phase} error: {error_msg[:120]}")
-                if video_id in row_by_id:
-                    if "private video" in error_msg.lower():
-                        row_by_id[video_id]["status"] = STATUS_FAILED
-                    row_by_id[video_id]["error"] = error_msg[:500]
-                results.append(AsrResult(video_id=video_id, status="error", error=error_msg))
-                err_count += 1
-                _write_video_index(video_index_path, rows)
-                if config.sleep_seconds > 0:
-                    time.sleep(config.sleep_seconds)
-                continue
-
-            # Step 3b: empty transcript
-            total_time = time.time() - t0
-            if not transcript_text.strip():
-                if not quiet:
-                    print(f"    ✗ Empty transcript (silent video?)")
-                result = AsrResult(video_id=video_id, status="error", error="ASR produced empty transcript")
-                results.append(result)
-                err_count += 1
-                if video_id in row_by_id:
-                    row_by_id[video_id]["error"] = result.error
-                _write_video_index(video_index_path, rows)
-                if config.sleep_seconds > 0:
-                    time.sleep(config.sleep_seconds)
-                continue
-
-            # Step 4: Write transcript file
-            ensure_dir(transcript_path.parent)
-            _write_asr_transcript(
-                path=transcript_path,
-                title=title,
-                video_id=video_id,
-                url=url,
-                channel=channel,
-                language=detected_lang or config.language,
-                transcript_text=transcript_text,
-            )
-            
-            # Update in-memory row
-            lang_used = detected_lang or config.language
-            if video_id in row_by_id:
-                row_by_id[video_id]["status"] = STATUS_OK
-                row_by_id[video_id]["language"] = lang_used
-                row_by_id[video_id]["source"] = SOURCE_ASR
-                row_by_id[video_id]["error"] = ""
-                row_by_id[video_id]["transcript_path"] = _relative_path_str(transcript_path, channel_dir)
-            
-            existing_transcripts[video_id] = transcript_path
-            result = AsrResult(
-                video_id=video_id,
-                status=STATUS_OK,
-                transcript_path=transcript_path,
-                language=lang_used,
-            )
-            results.append(result)
-            ok_count += 1
-            processing_times.append(total_time)
-            
-            # Success line + stats
-            if not quiet:
-                remaining = total_eligible - index
-                avg_time = sum(processing_times) / len(processing_times)
-                eta = _fmt_eta(avg_time, remaining)
-            
-                print(f"    ✓ Done in {_fmt_duration(total_time)} | lang={lang_used}")
-                print(f"    {_progress_bar(index, total_eligible)}  OK:{ok_count}  Err:{err_count}  Skip:{skip_count}  ETA: {eta}")
-                print()
-            
-            # Save CSV incrementally for crash safety
-            _write_video_index(video_index_path, rows)
-            _write_asr_progress(
-                meta_dir,
-                started_at=started_at,
-                index=index,
-                total=total_eligible,
-                ok=ok_count,
-                errors=err_count,
-                skipped=skip_count,
-                last_video_id=video_id,
-            )
-            
-            _release_gpu_memory(config.device)
-            
-            if config.sleep_seconds > 0:
-                time.sleep(config.sleep_seconds)
-            
+        _run_asr_pipeline(
+            eligible_rows=eligible_rows,
+            total_eligible=total_eligible,
+            config=config,
+            channel_dir=channel_dir,
+            meta_dir=meta_dir,
+            video_index_path=video_index_path,
+            rows=rows,
+            row_by_id=row_by_id,
+            existing_transcripts=existing_transcripts,
+            model_holder=model_holder,
+            results=results,
+            started_at=started_at,
+            quiet=quiet,
+            state=pipeline_state,
+            state_lock=state_lock,
+        )
     except KeyboardInterrupt:
         interrupted = True
         if not quiet:
             print("\n  Interrupted — saving progress to video_index.csv ...")
     finally:
         _write_video_index(video_index_path, rows)
+
+    ok_count = pipeline_state["ok_count"]
+    skip_count = pipeline_state["skip_count"]
+    err_count = pipeline_state["err_count"]
+    no_speech_count = pipeline_state["no_speech_count"]
+    rate_limited = pipeline_state["rate_limited"]
 
     # Final summary
     report = _build_report(config, rows, results, started_at=started_at)
@@ -459,6 +329,400 @@ def run_asr(config: AsrConfig) -> dict[str, Any]:
     if config.print_summary:
         _print_summary(report, wall_start)
     return report
+
+
+# ---------------------------------------------------------------------------
+# Pipelined download → GPU transcription
+# ---------------------------------------------------------------------------
+
+class _PipelineSentinel:
+    """Marks end of the download → GPU ready queue."""
+
+
+_PIPELINE_END = _PipelineSentinel()
+
+
+def _run_asr_pipeline(
+    *,
+    eligible_rows: list[dict[str, str]],
+    total_eligible: int,
+    config: AsrConfig,
+    channel_dir: Path,
+    meta_dir: Path,
+    video_index_path: Path,
+    rows: list[dict[str, str]],
+    row_by_id: dict[str, dict[str, str]],
+    existing_transcripts: dict[str, Path],
+    model_holder: dict[str, Any],
+    results: list[AsrResult],
+    started_at: str,
+    quiet: bool,
+    state: dict[str, Any],
+    state_lock: threading.Lock,
+) -> None:
+    """
+    Decoupled producer/consumer pipeline.
+
+    Download workers fill ``ready_queue`` as soon as each audio file is ready.
+    The GPU thread consumes from the queue without waiting for in-flight
+    downloads — so if transcription finishes in 15s but the next download
+    completed at 10s, the GPU picks it up immediately (zero idle gap).
+    """
+    workers = max(1, config.download_workers)
+    ready_queue: Queue[_PreparedVideo | _PipelineSentinel] = Queue(
+        maxsize=workers * 3,
+    )
+    rate_limit_lock = threading.Lock()
+    gpu_lock = threading.Lock()
+    videos_since_vram_cleanup = 0
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr-dl") as executor:
+        coordinator = threading.Thread(
+            target=_download_coordinator,
+            kwargs={
+                "eligible_rows": eligible_rows,
+                "total_eligible": total_eligible,
+                "config": config,
+                "executor": executor,
+                "ready_queue": ready_queue,
+                "workers": workers,
+                "quiet": quiet,
+                "rate_limit_lock": rate_limit_lock,
+                "state": state,
+                "state_lock": state_lock,
+            },
+            name="asr-dl-coordinator",
+            daemon=True,
+        )
+        coordinator.start()
+
+        while True:
+            prepared = ready_queue.get()
+            if prepared is _PIPELINE_END:
+                break
+
+            _process_prepared_video(
+                prepared=prepared,
+                config=config,
+                channel_dir=channel_dir,
+                meta_dir=meta_dir,
+                video_index_path=video_index_path,
+                rows=rows,
+                row_by_id=row_by_id,
+                existing_transcripts=existing_transcripts,
+                model_holder=model_holder,
+                results=results,
+                started_at=started_at,
+                quiet=quiet,
+                state=state,
+                state_lock=state_lock,
+                gpu_lock=gpu_lock,
+            )
+            if prepared.tmp_dir is not None:
+                prepared.tmp_dir.cleanup()
+
+            videos_since_vram_cleanup += 1
+            if videos_since_vram_cleanup >= 20:
+                _release_gpu_memory(config.device)
+                videos_since_vram_cleanup = 0
+
+        coordinator.join(timeout=5.0)
+
+
+def _download_coordinator(
+    *,
+    eligible_rows: list[dict[str, str]],
+    total_eligible: int,
+    config: AsrConfig,
+    executor: ThreadPoolExecutor,
+    ready_queue: Queue[_PreparedVideo | _PipelineSentinel],
+    workers: int,
+    quiet: bool,
+    rate_limit_lock: threading.Lock,
+    state: dict[str, Any],
+    state_lock: threading.Lock,
+) -> None:
+    """Keep ``workers`` downloads in flight; push each result into ``ready_queue``."""
+    row_iter = iter(enumerate(eligible_rows, start=1))
+    in_flight: dict[Future[_PreparedVideo], None] = {}
+
+    def submit_next() -> bool:
+        try:
+            index, row = next(row_iter)
+        except StopIteration:
+            return False
+        fut = executor.submit(
+            _download_prepared,
+            row=row,
+            index=index,
+            total=total_eligible,
+            config=config,
+            quiet=quiet,
+            rate_limit_lock=rate_limit_lock,
+            state=state,
+            state_lock=state_lock,
+        )
+        in_flight[fut] = None
+        # Stagger download starts (rate-limit protection) without blocking the GPU.
+        if config.sleep_seconds > 0:
+            time.sleep(config.sleep_seconds / workers)
+        return True
+
+    for _ in range(min(workers, total_eligible)):
+        submit_next()
+
+    while in_flight:
+        done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+        for fut in done:
+            in_flight.pop(fut)
+            prepared = fut.result()
+            ready_queue.put(prepared)
+            submit_next()
+
+    ready_queue.put(_PIPELINE_END)
+
+
+def _download_prepared(
+    *,
+    row: dict[str, str],
+    index: int,
+    total: int,
+    config: AsrConfig,
+    quiet: bool,
+    rate_limit_lock: threading.Lock,
+    state: dict[str, Any],
+    state_lock: threading.Lock,
+) -> _PreparedVideo:
+    """Download audio for one video (runs in a worker thread)."""
+    video_id = row.get("video_id", "").strip()
+    title = row.get("title", "").strip() or video_id
+    url = row.get("url", "").strip()
+
+    if not video_id or not url:
+        return _PreparedVideo(
+            index=index, total=total, row=row,
+            skipped=True, skip_reason="Missing video_id or url",
+        )
+
+    short_title = (title[:45] + "...") if len(title) > 45 else title
+    if not quiet:
+        with state_lock:
+            print(f"  ▶ [{index}/{total}] {short_title}")
+            print(f"    ID: {video_id}")
+            print(f"    ↓ [{index}/{total}] Downloading...", end="", flush=True)
+
+    rate_limit_waits = 0
+    while True:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            dl_start = time.time()
+            audio_path = _download_audio(
+                url=url,
+                tmp_dir=Path(tmp.name),
+                verbose=config.verbose,
+                cookies=config.cookies,
+                max_retries=2,
+                sleep_base=2.0,
+            )
+            if not quiet:
+                with state_lock:
+                    print(f" OK ({_fmt_duration(time.time() - dl_start)})")
+            return _PreparedVideo(
+                index=index, total=total, row=row,
+                audio_path=audio_path, tmp_dir=tmp,
+            )
+        except Exception as exc:
+            tmp.cleanup()
+            if is_rate_limit_error(exc):
+                rate_limit_waits += 1
+                with state_lock:
+                    state["rate_limited"] = True
+                exponent = min(rate_limit_waits - 1, config.max_rate_limit_waits)
+                backoff = min(
+                    config.rate_limit_wait_seconds * (2 ** exponent),
+                    RATE_LIMIT_MAX_BACKOFF,
+                )
+                if not quiet:
+                    with state_lock:
+                        print(" RATE-LIMITED")
+                        print(
+                            f"    ⏸ YouTube rate limit (retry #{rate_limit_waits}). "
+                            f"Backing off {_fmt_duration(backoff)} then retrying..."
+                        )
+                with rate_limit_lock:
+                    time.sleep(backoff)
+                continue
+            if not quiet:
+                with state_lock:
+                    print(" FAILED")
+            return _PreparedVideo(
+                index=index, total=total, row=row,
+                error_msg=str(exc),
+            )
+
+
+def _process_prepared_video(
+    *,
+    prepared: _PreparedVideo,
+    config: AsrConfig,
+    channel_dir: Path,
+    meta_dir: Path,
+    video_index_path: Path,
+    rows: list[dict[str, str]],
+    row_by_id: dict[str, dict[str, str]],
+    existing_transcripts: dict[str, Path],
+    model_holder: dict[str, Any],
+    results: list[AsrResult],
+    started_at: str,
+    quiet: bool,
+    state: dict[str, Any],
+    state_lock: threading.Lock,
+    gpu_lock: threading.Lock,
+) -> None:
+    """Transcribe a prefetched video and update index (GPU thread — main loop)."""
+    row = prepared.row
+    video_id = row.get("video_id", "").strip()
+    title = row.get("title", "").strip() or video_id
+    url = row.get("url", "").strip()
+    channel = row.get("assigned_playlist_title", "").strip()
+    index = prepared.index
+    total = prepared.total
+
+    if prepared.skipped:
+        if not quiet:
+            with state_lock:
+                print(f"  ⚠ [{index}/{total}] Skipping — {prepared.skip_reason}")
+        with state_lock:
+            results.append(AsrResult(video_id=video_id, status="skipped", error=prepared.skip_reason))
+            state["skip_count"] += 1
+        return
+
+    folder_rel = row.get("folder", "").strip()
+    target_dir = channel_dir / folder_rel if folder_rel else channel_dir / "Sin_Playlist"
+    transcript_path = target_dir / build_transcript_filename(video_id=video_id, title=title)
+
+    t0 = time.time()
+
+    if prepared.error_msg:
+        if not quiet:
+            with state_lock:
+                phase = "Transcription" if "Transcription failed" in prepared.error_msg else "Download"
+                print(f"    ✗ {phase} error: {prepared.error_msg[:120]}")
+        with state_lock:
+            if video_id in row_by_id:
+                if "private video" in prepared.error_msg.lower():
+                    row_by_id[video_id]["status"] = STATUS_FAILED
+                row_by_id[video_id]["error"] = prepared.error_msg[:500]
+            results.append(AsrResult(video_id=video_id, status="error", error=prepared.error_msg))
+            state["err_count"] += 1
+            _write_video_index(video_index_path, rows)
+        return
+
+    transcript_text = ""
+    detected_lang = ""
+    try:
+        if not quiet:
+            with state_lock:
+                print(f"    🎙 [{index}/{total}] Transcribing...", end="", flush=True)
+        tr_start = time.time()
+        with gpu_lock:
+            transcript_text, detected_lang = _transcribe_audio_with_retry(
+                audio_path=prepared.audio_path,  # type: ignore[arg-type]
+                model_holder=model_holder,
+                config=config,
+                quiet=True,
+            )
+        if not quiet:
+            with state_lock:
+                print(f" OK ({_fmt_duration(time.time() - tr_start)})")
+    except Exception as exc:
+        error_msg = str(exc)
+        if not quiet:
+            with state_lock:
+                print(f" FAILED")
+                print(f"    ✗ Transcription error: {error_msg[:120]}")
+        with state_lock:
+            if video_id in row_by_id:
+                row_by_id[video_id]["error"] = error_msg[:500]
+            results.append(AsrResult(video_id=video_id, status="error", error=error_msg))
+            state["err_count"] += 1
+            _write_video_index(video_index_path, rows)
+        return
+
+    total_time = time.time() - t0
+
+    if not transcript_text.strip():
+        if not quiet:
+            with state_lock:
+                print(f"    ⏭ No speech detected (music/silent) — marked no_speech")
+        with state_lock:
+            results.append(AsrResult(
+                video_id=video_id, status=STATUS_NO_SPEECH,
+                error="No speech detected (music/silence)",
+            ))
+            state["no_speech_count"] += 1
+            if video_id in row_by_id:
+                row_by_id[video_id]["status"] = STATUS_NO_SPEECH
+                row_by_id[video_id]["error"] = "No speech detected (music/silence)"
+            _write_video_index(video_index_path, rows)
+        return
+
+    ensure_dir(transcript_path.parent)
+    _write_asr_transcript(
+        path=transcript_path,
+        title=title,
+        video_id=video_id,
+        url=url,
+        channel=channel,
+        language=detected_lang or config.language,
+        transcript_text=transcript_text,
+    )
+
+    lang_used = detected_lang or config.language
+    with state_lock:
+        if video_id in row_by_id:
+            row_by_id[video_id]["status"] = STATUS_OK
+            row_by_id[video_id]["language"] = lang_used
+            row_by_id[video_id]["source"] = SOURCE_ASR
+            row_by_id[video_id]["error"] = ""
+            row_by_id[video_id]["transcript_path"] = _relative_path_str(transcript_path, channel_dir)
+
+        existing_transcripts[video_id] = transcript_path
+        results.append(AsrResult(
+            video_id=video_id,
+            status=STATUS_OK,
+            transcript_path=transcript_path,
+            language=lang_used,
+        ))
+        state["ok_count"] += 1
+        state["processing_times"].append(total_time)
+
+        ok = state["ok_count"]
+        no_speech = state["no_speech_count"]
+        err = state["err_count"]
+        skip = state["skip_count"]
+        times: list[float] = state["processing_times"]
+
+        _write_video_index(video_index_path, rows)
+        _write_asr_progress(
+            meta_dir,
+            started_at=started_at,
+            index=index,
+            total=total,
+            ok=ok,
+            errors=err,
+            skipped=skip,
+            last_video_id=video_id,
+        )
+
+    if not quiet:
+        remaining = total - index
+        avg_time = sum(times) / len(times) if times else 0.0
+        eta = _fmt_eta(avg_time, remaining)
+        with state_lock:
+            print(f"    ✓ Done in {_fmt_duration(total_time)} | lang={lang_used}")
+            print(f"    {_progress_bar(index, total)}  OK:{ok}  NoSpc:{no_speech}  Err:{err}  Skip:{skip}  ETA: {eta}")
+            print()
 
 
 # ---------------------------------------------------------------------------
@@ -478,17 +742,22 @@ def _auto_optimize_config(config: AsrConfig, quiet: bool = False) -> AsrConfig:
         return config
 
     try:
-        from transcriptex.dependency_manager import ensure_torch
-        ensure_torch()
-        import torch
-        if not torch.cuda.is_available():
+        from transcriptex.dependency_manager import cuda_available
+
+        if not cuda_available():
             return config
 
-        total_vram_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
-        device_name = torch.cuda.get_device_name(0)
+        from transcriptex.dependency_manager import nvidia_gpu_info
+        gpu_info = nvidia_gpu_info()
+        if gpu_info is None:
+            return config  # Unknown VRAM must not be interpreted as a zero-memory GPU.
+        device_name, total_vram_mb = gpu_info
 
         if not quiet:
-            print(f"  GPU: {device_name} ({total_vram_mb:.0f} MB VRAM)")
+            if total_vram_mb > 0:
+                print(f"  GPU: {device_name} ({total_vram_mb:.0f} MB VRAM)")
+            else:
+                print(f"  GPU: {device_name}")
 
         # Make a mutable copy (dataclass replace)
         new_config = AsrConfig(
@@ -511,6 +780,7 @@ def _auto_optimize_config(config: AsrConfig, quiet: bool = False) -> AsrConfig:
             rate_limit_wait_seconds=config.rate_limit_wait_seconds,
             max_rate_limit_waits=config.max_rate_limit_waits,
             yt_sleep_interval=config.yt_sleep_interval,
+            download_workers=config.download_workers,
         )
 
         # Optimize compute_type based on VRAM
@@ -712,21 +982,16 @@ def _write_asr_progress(
 
 
 def _release_gpu_memory(device: str) -> None:
-    """Best-effort VRAM cleanup between videos to reduce OOM risk on long runs."""
-    if device != "cuda":
-        return
-    try:
-        from transcriptex.dependency_manager import ensure_torch
-        ensure_torch()
-        import gc
-        import torch  # type: ignore
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    except Exception:
-        pass
+    """Collect released objects; do not install another inference engine to clean CT2."""
+    import gc
+    gc.collect()
+    torch = sys.modules.get('torch')
+    if device == 'cuda' and torch is not None:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -742,7 +1007,7 @@ def _load_model(config: AsrConfig, quiet: bool = False) -> Any:
     """
     Load the faster-whisper WhisperModel. Falls back to CPU if CUDA unavailable.
     """
-    from transcriptex.dependency_manager import ensure_faster_whisper, ensure_torch
+    from transcriptex.dependency_manager import ensure_faster_whisper
     ensure_faster_whisper()
     from faster_whisper import WhisperModel  # type: ignore
 
@@ -751,9 +1016,9 @@ def _load_model(config: AsrConfig, quiet: bool = False) -> Any:
 
     # Auto-detect CUDA availability
     if device == "cuda":
-        ensure_torch()
-        import torch  # type: ignore
-        if not torch.cuda.is_available():
+        from transcriptex.dependency_manager import cuda_available
+
+        if not cuda_available():
             if not quiet:
                 print("Warning: CUDA not available, falling back to CPU (transcription will be slow)")
             device = "cpu"
@@ -950,6 +1215,7 @@ def _build_report(
     ok_count = sum(1 for r in results if r.status == STATUS_OK)
     skipped_count = sum(1 for r in results if r.status == "skipped")
     error_count = sum(1 for r in results if r.status == "error")
+    no_speech_count = sum(1 for r in results if r.status == STATUS_NO_SPEECH)
     return {
         "started_at": started_at,
         "finished_at": now_utc_iso(),
@@ -962,6 +1228,7 @@ def _build_report(
         "ok": ok_count,
         "skipped": skipped_count,
         "errors": error_count,
+        "no_speech": no_speech_count,
     }
 
 
@@ -982,6 +1249,7 @@ def _print_summary(report: dict[str, Any], wall_start: float | None = None) -> N
     print(f"  Processed  : {report.get('total_processed', 0)}")
     print(f"  ✓ OK       : {report.get('ok', 0)}")
     print(f"  ⏭ Skipped  : {report.get('skipped', 0)}")
+    print(f"  ♪ No speech : {report.get('no_speech', 0)}")
     print(f"  ✗ Errors   : {report.get('errors', 0)}")
     if report.get("rate_limited"):
         print("  ⚠ Hit YouTube rate limits during the run (auto-retried).")

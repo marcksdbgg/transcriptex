@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import queue
 import sys
 import shutil
 import textwrap
-import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -18,6 +19,18 @@ class RealtimeConfig:
     process: str = ""
     list_devices: bool = False
     device_index: int = -1
+    source: str = "@DEFAULT_MONITOR@"
+    microphone: str = ""
+    monitor_stream: int = -1
+    output: str = ""
+    max_segment_duration: float = 15.0
+    silence_duration: float = 0.6
+    silence_threshold: float = 0.002
+    overlap_duration: float = 1.0
+    preview: bool = True
+    finalize: bool = True
+    record_audio: bool = False
+    queue_seconds: float = 30.0
 
 
 class RealtimeTranscriber:
@@ -33,6 +46,8 @@ class RealtimeTranscriber:
     def __init__(self, config: RealtimeConfig):
         self.config = config
         self.model = self._init_whisper()
+        global np
+        import numpy as np
         self.audio_queue = queue.Queue()
         self.buffer = np.array([], dtype=np.float32)
         
@@ -40,45 +55,13 @@ class RealtimeTranscriber:
         self.is_running = False
         self.lines_to_clear = 0
         self.last_text = ""
+        self.last_metrics = ""
         self.committed_history = ""
         
     def _init_whisper(self):
-        print(f"  [ASR] Initializing faster-whisper ({self.config.model})...")
-        from transcriptex.dependency_manager import ensure_faster_whisper, ensure_torch
-        ensure_faster_whisper()
-        from faster_whisper import WhisperModel
-
-        device = self.config.device
-        compute_type = self.config.compute_type
-
-        # Ensure torch is available when CUDA is requested so we can probe it
-        if device == "cuda":
-            ensure_torch()
-            import torch
-            if not torch.cuda.is_available():
-                print("  [WARN] CUDA unavailable. Falling back to CPU (int8).")
-                device = "cpu"
-                compute_type = "int8"
-
-        try:
-            model = WhisperModel(
-                self.config.model,
-                device=device,
-                compute_type=compute_type,
-            )
-            return model
-        except Exception as e:
-            if device == "cuda" and ("cublas" in str(e).lower() or "cuda" in str(e).lower() or "gpu" in str(e).lower()):
-                print(f"  [WARN] CUDA libraries not available ({e})")
-                print("  [WARN] Falling back to CPU (int8). Install CUDA toolkit for GPU support.")
-                print("         Download from: https://developer.nvidia.com/cuda-downloads")
-                model = WhisperModel(
-                    self.config.model,
-                    device="cpu",
-                    compute_type="int8",
-                )
-                return model
-            raise
+        from transcriptex.asr_engine import ASREngine
+        self.engine = ASREngine(self.config.model, self.config.device, self.config.compute_type)
+        return self.engine.load()
 
     def _list_devices(self):
         from transcriptex.dependency_manager import ensure_pyaudiowpatch, ensure_numpy
@@ -360,6 +343,7 @@ class RealtimeTranscriber:
                 vad_parameters=dict(min_silence_duration_ms=400)
             )
             
+            segments = list(segments)
             t1 = time.time()
             proc_time = t1 - t0
             rtf = proc_time / audio_dur if audio_dur > 0 else 0.0
@@ -380,8 +364,8 @@ class RealtimeTranscriber:
             if (is_silence or len(self.buffer) >= max_buffer_frames) and self.last_text != "":
                 self._update_terminal_ui(self.last_text, metrics="")
                 
-                self.committed_history += (" " + self.last_text)
-                self.lines_to_clean = 0
+                self.committed_history = (self.committed_history + " " + self.last_text)[-600:]
+                self.lines_to_clear = 0
                 self.last_text = ""
                 self.last_metrics = ""
                 
@@ -392,6 +376,7 @@ class RealtimeTranscriber:
                     
         except Exception as e:
             self.buffer = self.buffer[-int(native_rate * 0.5):]
+            raise RuntimeError(f"Live recognition failed: {e}") from e
 
 
     def _run_wasapi_loop(self) -> dict:
@@ -482,5 +467,11 @@ class RealtimeTranscriber:
 
 
 def run_realtime(config: RealtimeConfig) -> dict:
+    if sys.platform.startswith("linux"):
+        from transcriptex.realtime_linux import run_linux
+        return run_linux(config)
+    if config.list_devices:
+        RealtimeTranscriber.__new__(RealtimeTranscriber)._list_devices()
+        return {"success": True}
     transcriber = RealtimeTranscriber(config)
     return transcriber.run()

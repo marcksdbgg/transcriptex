@@ -1,0 +1,5 @@
+interface:
+  display_name: "Transcriptex"
+  short_description: "Transcribe medios, YouTube y llamadas en Linux"
+  icon_small: "./assets/icon-small.png"
+  icon_large: "./assets/icon-large.png"

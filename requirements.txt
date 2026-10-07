@@ -2,13 +2,9 @@
 yt-dlp>=2026.2.4
 yt-dlp-ejs>=0.8.0
 
-# ASR / Transcription dependencies (auto-installed on first use by dependency_manager.py)
-# If you have an NVIDIA GPU, the CLI will automatically install torch with CUDA support.
-# If not, it will install the CPU-only wheel.
-torch>=2.1.0
-faster-whisper>=1.1.0
-
-# Real-time transcription (Windows WASAPI loopback)
-sounddevice>=0.4.6
-pyaudiowpatch>=0.2.12
+# ASR uses CTranslate2; PyTorch is not required.
+faster-whisper>=1.2.1
 numpy>=1.24.0
+
+# Windows WASAPI capture only (Linux uses system parec/pactl).
+pyaudiowpatch>=0.2.12; sys_platform == "win32"

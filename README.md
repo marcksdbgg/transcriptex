@@ -13,7 +13,7 @@
 3. [Installation](#installation)
 4. [Commands](#commands)
    - [run — Export YouTube channel transcripts](#1-run--export-youtube-channel-transcripts)
-   - [transcribe — Transcribe a single file or YouTube URL](#2-transcribe--transcribe-a-single-file-or-youtube-url)
+   - [transcribe — Transcribe files or video URLs](#2-transcribe--transcribe-files-or-video-urls)
    - [asr — Batch ASR fallback for missing subtitles](#3-asr--batch-asr-fallback-for-missing-subtitles)
    - [realtime — Live system audio transcription](#4-realtime--live-system-audio-transcription)
    - [audit — Audit an existing channel output folder](#5-audit--audit-an-existing-channel-output-folder)
@@ -29,8 +29,8 @@
 - Indexes videos across channel tabs (`videos`, `shorts`, `streams`).
 - Fetches YouTube's native subtitle tracks (manual + auto-generated) — **no audio downloaded** in the main flow.
 - Falls back to local GPU transcription (`faster-whisper`) via the `asr` command for videos with no subtitles.
-- **Transcribes any single local audio/video file or YouTube URL** via the `transcribe` command (SRT, VTT, TXT, JSON output).
-- **Captures and transcribes live system audio** in real-time via WASAPI Loopback (`realtime` command, Windows only).
+- **Transcribes local audio/video files or YouTube URLs** via the `transcribe` command (SRT, VTT, TXT, JSON output).
+- **Captures and transcribes live system audio** through PulseAudio/PipeWire on Linux or WASAPI Loopback on Windows.
 - Includes an `audit` command to detect missing, orphaned, or duplicate transcript files.
 - Includes a `search` command to find and export transcripts by keyword, phrase, regex, video ID, or playlist.
 - Writes detailed metadata reports in a `_meta` folder per channel.
@@ -43,7 +43,7 @@
 transcriptex/
 ├── __init__.py          # Package version (0.1.0)
 ├── __main__.py          # Enables: python -m transcriptex
-├── cli.py               # Argument parser & command dispatcher (6 subcommands)
+├── cli.py               # Argument parser & command dispatcher (8 subcommands)
 ├── models.py            # Shared dataclasses: VideoRecord, PlaylistRecord, ChannelInfo, SubtitleTrack, TranscriptResult
 ├── url_utils.py         # YouTube URL normalization, video/playlist ID extraction
 ├── fs_utils.py          # Filename sanitization, transcript filename builder, directory helpers
@@ -53,11 +53,14 @@ transcriptex/
 ├── asr_engine.py        # ASREngine class: lazy-loading wrapper around faster-whisper WhisperModel
 ├── asr.py               # Batch ASR pipeline: reads video_index.csv, downloads audio, transcribes, updates CSV
 ├── transcribe_single.py # SingleTranscriber class: transcribes one local file or YouTube URL
-└── realtime.py          # RealtimeTranscriber class: WASAPI loopback capture + live Whisper transcription
+├── subtitle_segments.py # Timed subtitle cues for URL exports
+├── live_decoder.py      # Pause-aware bounded Linux recognition with provisional previews
+├── realtime_linux.py    # PipeWire/PulseAudio capture and full-recording finalization
+└── realtime.py          # Realtime configuration and Windows WASAPI backend
 ```
 
 **Key design points:**
-- All heavy imports (`faster_whisper`, `torch`, `sounddevice`, `pyaudiowpatch`) are lazy — only loaded when actually used.
+- Heavy inference and capture imports (`faster_whisper`, `numpy`, `pyaudiowpatch`) are lazy — only loaded when actually used. PyTorch and sounddevice are not required.
 - `ASREngine` handles CUDA availability detection and falls back to `cpu/int8` automatically.
 - The `asr` pipeline saves `video_index.csv` incrementally after each video, making it crash-safe and resumable.
 - `ChannelTranscriber` uses `YouTubeClient` for all network calls, keeping concerns separated.
@@ -70,7 +73,8 @@ transcriptex/
 
 - Python 3.10+
 - `yt-dlp >= 2026.2.4`
-- `ffmpeg` on PATH (required for audio extraction — download from [ffmpeg.org](https://ffmpeg.org/))
+- `ffmpeg` on PATH for the channel ASR extraction pipeline and media conversion. Single-file ASR decodes through PyAV; single-video URLs keep compressed audio.
+- Linux realtime: PulseAudio client utilities (`parec`, `pactl`), also supported on PipeWire.
 
 ```bash
 pip install -r requirements.txt
@@ -82,8 +86,8 @@ pip install -r requirements.txt
 # faster-whisper for ASR and single file transcription
 pip install faster-whisper
 
-# CUDA-enabled PyTorch for GPU acceleration (RTX recommended)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+# faster-whisper uses CTranslate2 for GPU acceleration; PyTorch is not its inference engine.
+# Configure the compatible CUDA/cuDNN runtime for CTranslate2 on your platform.
 
 # Realtime audio capture (Windows only)
 pip install pyaudiowpatch numpy
@@ -106,6 +110,22 @@ Alternatively, run without installing:
 ```bash
 python -m transcriptex <command> [args]
 ```
+
+### Codex integration
+
+The reusable Codex skill is in `integrations/codex/transcriptex/`, including
+its small and large transparent PNG icons and `agents/openai.yaml` metadata.
+Install the CLI first, then copy the skill from this checkout:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/transcriptex"
+cp -R integrations/codex/transcriptex/. "${CODEX_HOME:-$HOME/.codex}/skills/transcriptex/"
+```
+
+Invoke `$transcriptex` in Codex. If its icon is cached, reopen Codex to reload
+the skill metadata. FFmpeg remains available for media preparation and editing.
+Generated transcripts, scratch audio, logs and installation metadata are kept
+locally and ignored by Git.
 
 ---
 
@@ -148,16 +168,16 @@ transcriptex run "https://www.youtube.com/@mychannel" \
 
 ---
 
-### 2. `transcribe` — Transcribe a Single File or YouTube URL
+### 2. `transcribe` — Transcribe Files or Video URLs
 
-Transcribes **any local audio/video file** (MP4, MKV, MP3, WAV, etc.) or a **YouTube URL** using local `faster-whisper`.
+Transcribes **local audio/video files** (MP4, MKV, MP3, WAV, etc.) with local `faster-whisper`. Video URLs prefer existing manual/automatic subtitles and fall back to local ASR when unavailable. One invocation can accept several inputs and reuse one ASR model.
 
 ```bash
-transcriptex transcribe <input_path> [options]
+transcriptex transcribe <input_path> [more_inputs ...] [options]
 ```
 
 When given a local file, the file is read directly — **no download occurs**.  
-When given a YouTube URL, audio is temporarily downloaded via yt-dlp, then deleted after transcription.
+For a URL, `--source auto` tries native subtitles first, without loading a model or downloading audio. If subtitles are unavailable, yt-dlp downloads compressed audio temporarily and PyAV decodes it directly. `--source asr` forces recognition; `--source subtitles` fails instead of using ASR. The JSON report includes source, language, timing and the output path.
 
 #### Options
 
@@ -169,7 +189,13 @@ When given a YouTube URL, audio is temporarily downloaded via yt-dlp, then delet
 | `--device` | `auto` | `auto` (GPU if available, else CPU), `cuda`, or `cpu` |
 | `--compute-type` | `auto` | `auto` (float16 for GPU, int8 for CPU), or explicit: `float16`, `int8_float16`, `int8`, `float32` |
 | `--language` | *(auto-detect)* | Language code, e.g. `es`, `en`. Empty = auto-detect |
-| `--beam-size` | `5` | Beam search width (higher = better quality, slower) |
+| `--beam-size` | `1` | Beam search width; `5` explores more candidates at greater cost, without guaranteeing better quality |
+| `--source` | `auto` | URL subtitles first; `subtitles` requires captions, `asr` forces recognition |
+| `--lang-priority` | `--language` or `es,en` | Subtitle language preferences |
+| `--batch-size` | `0` | Auto: 8 on CUDA / 1 on CPU; reduced on GPU OOM |
+| `--no-vad` | — | Disable silence filtering and batching |
+| `--json` | — | A single JSON report on stdout; diagnostics on stderr |
+| `--quiet` | — | Suppress the human summary |
 | `--verbose` | — | Enable verbose output |
 
 #### Formats
@@ -211,6 +237,21 @@ transcriptex transcribe "https://www.youtube.com/watch?v=VIDEOID" --language es
 
 ---
 
+#### Automation and multiple files
+
+```bash
+transcriptex transcribe video.mp4 recording.wav --language es --format json --json -o ./transcripts
+transcriptex transcribe "https://www.youtube.com/watch?v=VIDEOID" --source subtitles --json -o ./transcripts
+transcriptex transcribe "https://www.youtube.com/watch?v=VIDEOID" --source asr --language es --json -o ./transcripts
+```
+
+`--format json` writes the segment array; `--json` prints the command report.
+The report names the output file. Multiple inputs return `report.results`; exit 2
+means some inputs failed, while successful outputs remain available. Identical
+input arguments are processed once. Outputs are written atomically, and duplicate
+local stems in a shared output directory receive a path-derived suffix.
+`--batch-size 1` selects sequential ASR. Weights load lazily only if ASR is needed.
+
 ### 3. `asr` — Batch ASR Fallback for Missing Subtitles
 
 After running `transcriptex run`, videos with no YouTube subtitles are marked `no_subtitles` in `video_index.csv`. This command processes those videos using local Whisper.
@@ -233,8 +274,8 @@ transcriptex asr "output/My Channel"
 | `--device` | `cuda` | `cuda` or `cpu` |
 | `--compute-type` | `float16` | Quantization type |
 | `--language` | `es` | Language code |
-| `--beam-size` | `5` | Beam search size |
-| `--batch-size` | `8` | Audio chunk batch size |
+| `--beam-size` | `1` | Beam search size |
+| `--batch-size` | `16` | Audio chunk batch size |
 | `--force` | — | Re-transcribe videos that already have a file |
 | `--limit N` | `0` (no limit) | Process at most N videos per run |
 | `--sleep` | `0.0` | Seconds to wait between videos |
@@ -281,33 +322,53 @@ transcriptex asr "output/Jesús G. Maestro" --include-failed --cookies cookies.t
 
 ### 4. `realtime` — Live System Audio Transcription
 
-Captures audio playing on your PC (browsers, media players, meetings, etc.) via **WASAPI Loopback** and transcribes it live to the console.
-
-> **Windows only.** Requires `pyaudiowpatch` and `numpy`.
+Linux uses **PulseAudio/PipeWire**; Windows uses **WASAPI** and requires
+`pyaudiowpatch`. List devices before selecting a source:
 
 ```bash
-transcriptex realtime
+transcriptex realtime --list-devices
+# Linux:
+transcriptex realtime --language es --output meeting.txt
 ```
 
-Press **Ctrl+C** to stop.
+Press **Ctrl+C** to stop. Linux drains queued audio and confirms the current
+utterance, then generates `meeting.final.txt` from the full recording. Audio is
+spooled locally into temporary WAV files and removed on completion; add
+`--record-audio` to retain separate source WAVs, or `--no-finalize` to skip the
+full-recording pass. An abrupt kill cannot perform finalization; the live TXT
+already written remains usable. New transcript/audio files request mode 0600 on filesystems that support POSIX permissions.
 
-#### Options
+`[Parcial]` console lines are previews and can change. The live TXT contains only
+confirmed segments. Linux commits at pauses instead of cutting every three
+seconds. Long utterances use overlapping bounded windows and word timestamps to
+avoid repeating the overlap. Source labels are **not speaker diarization**.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `medium` | Whisper model (smaller = lower latency) |
-| `--device` | `cuda` | `cuda` or `cpu` |
-| `--compute-type` | `float16` | Quantization type |
-| `--language` | *(auto-detect)* | Language code. Empty = auto-detect |
-| `--beam-size` | `1` | Beam size (1 = fastest for live use) |
-| `--chunk-duration` | `3.0` | Audio buffer window duration in seconds |
-| `--process` | *(empty)* | Captures audio only from a specific process by name (e.g. `zen.exe`). Requires Windows 10/11 Application Loopback. |
+| `--model` | `large-v3-turbo` | Local Whisper model |
+| `--device` | `auto` | CUDA if available, otherwise CPU |
+| `--compute-type` | `auto` | float16 on CUDA / int8 on CPU |
+| `--language` | auto | Language code |
+| `--beam-size` | `1` | Live decoding beam |
+| `--chunk-duration` | `3.0` | Linux preview interval / Windows buffer window |
+| `--source` | `@DEFAULT_MONITOR@` | Linux audio source |
+| `--microphone` | empty | Optional second Linux input source |
+| `--monitor-stream` | `-1` | Linux sink-input index to isolate meeting playback |
+| `--output` | empty | Required Linux TXT path, appended and flushed |
+| `--max-segment-duration` | `15.0` | Maximum Linux segment before overlapping cut; at most 30 s |
+| `--silence-duration` | `0.6` | Pause needed to confirm speech |
+| `--silence-threshold` | `0.002` | RMS pause threshold |
+| `--overlap-duration` | `1.0` | Context retained at a forced cut |
+| `--queue-seconds` | `30.0` | Bounded queued audio per source; overflow is an explicit error |
+| `--no-preview` | off | Lower GPU usage; only show confirmed segments |
+| `--no-finalize` | off | Skip full-recording final pass |
+| `--record-audio` | off | Retain source WAVs beside the transcript |
+| `--process` | empty | Windows-only application capture by process name |
 
-#### Example
-
-```bash
-transcriptex realtime --model medium --language es --chunk-duration 3.0
-```
+Source names and monitor stream/sink relationships are validated before loading a model. Capture properties disable PipeWire fallback and reconnection to another source; the runtime checks the capture route every second and fails on mismatches or stalled PCM. Normal Linux sources retry briefly after EOF only while the same source exists. An isolated meeting stream that
+ends fails explicitly: find its new index and restart; capture never broadens to
+all system audio automatically. Capture errors are recorded and cause a failing
+exit status. The available audio may still receive a final transcription. Longer context does not guarantee that the final pass will be more accurate than every live segment.
 
 ---
 
@@ -438,11 +499,21 @@ Generated at: 2026-02-24T10:00:00+00:00
 
 - **No API key required.** The tool uses `yt-dlp` to extract metadata and subtitle URLs anonymously.
 - **The `run` command never downloads audio.** Only subtitle track bytes are fetched. Use `asr` or `transcribe` for audio-based transcription.
-- **ffmpeg is required** for the `asr` and `transcribe` commands (audio extraction). Install it and add it to your PATH.
+- **ffmpeg remains useful** for the channel `asr` extraction pipeline and conversion. Single-file ASR uses PyAV; caption retrieval needs neither GPU nor audio extraction.
 - **ASR is resumable.** Re-running `transcriptex asr` continues from `_meta/video_index.csv` and skips transcript files that already exist on disk.
 - **Private videos need auth.** Rows marked `failed` usually need `--include-failed` plus `--cookies` or browser-exported cookies.
 - **CUDA fallback:** If CUDA is unavailable, `ASREngine` automatically switches to `cpu` with `int8` quantization.
 - **Windows environments:** Set `HF_HUB_DISABLE_SYMLINKS=1` (already applied in `asr.py`) to avoid permission errors when downloading Whisper model weights as a non-admin user.
 - **Restricted videos** (private, members-only, region-blocked) will fail gracefully and be logged in `video_index.csv`.
 - **Incremental runs:** Re-running `transcriptex run` skips videos that already have a transcript file. Use `--force` to regenerate all.
-- **Realtime is Windows-only** (WASAPI Loopback via `pyaudiowpatch`). It is not available on Linux/macOS.
+- **Realtime supports Linux and Windows.** macOS capture is not implemented.
+
+## Linux realtime (PulseAudio / PipeWire)
+
+`transcriptex realtime` supports Linux through `parec` and `pactl`, without WASAPI dependencies. Use `--list-devices` to list sources and `pactl list sink-inputs` to identify the active meeting stream.
+
+```bash
+transcriptex realtime --model large-v3-turbo --language es --chunk-duration 3 --source HEADSET.monitor --monitor-stream MEET_INDEX --microphone MICROPHONE_SOURCE --output meeting.txt
+```
+
+Replace the source names and numeric stream index with current values. `--microphone` is optional; `--monitor-stream` isolates the chosen playback stream. Without a stream index, the selected source contains all its playback audio. `--process` remains a Windows-only option. Text is appended as UTF-8 and flushed after each segment; timestamps mark recognized segment starts and labels identify audio sources, not individual speakers. Ctrl+C stops capture, drains pending frames and generates a final full-recording transcript by default; the last capture frame can be incomplete. If the meeting recreates its audio stream, stop and select the new sink-input index. Use `--record-audio` if you also want to retain source audio for later correction.

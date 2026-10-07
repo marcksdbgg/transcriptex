@@ -3,6 +3,8 @@ import os
 import tempfile
 import time
 import warnings
+import hashlib
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,13 +35,18 @@ class TranscribeSingleConfig:
     cookies: str = ""
     quiet: bool = False
     print_summary: bool = True
+    source: str = "auto"
+    lang_priority: str = ""
+    batch_size: int = 0
+    vad_filter: bool = True
+    output_stem: str = ""
 
 
 class SingleTranscriber:
-    def __init__(self, config: TranscribeSingleConfig):
+    def __init__(self, config: TranscribeSingleConfig, engine: ASREngine | None = None):
         self.config = config
         self.client = YouTubeClient(verbose=config.verbose, cookies=config.cookies)
-        self.engine = ASREngine(
+        self.engine = engine or ASREngine(
             model_size=config.model,
             device=config.device,
             compute_type=config.compute_type
@@ -47,10 +54,10 @@ class SingleTranscriber:
 
     def _format_timestamp(self, seconds: float, separator: str = ",") -> str:
         """Format seconds into HH:MM:SS,mmm or HH:MM:SS.mmm format."""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        milliseconds = int(round((seconds - int(seconds)) * 1000))
+        total_ms = max(0, round(seconds * 1000))
+        hours, remainder = divmod(total_ms, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, milliseconds = divmod(remainder, 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}{separator}{milliseconds:03d}"
 
     def _write_srt(self, segments: list[Any], file_path: Path):
@@ -111,106 +118,88 @@ class SingleTranscriber:
             f.write(output)
             f.write("\n")
 
+    def _try_subtitles(self):
+        from transcriptex.transcriber import select_subtitle_track
+        from transcriptex.subtitle_segments import parse_subtitle_segments
+        info = self.client.extract_video_info(self.config.input_path)
+        priorities = [p.strip() for p in self.config.lang_priority.split(',') if p.strip()]
+        priorities = priorities or ([self.config.language] if self.config.language else ['es', 'en'])
+        track = select_subtitle_track(info, priorities)
+        if track is None:
+            raise ValueError('No subtitle tracks available')
+        segments = parse_subtitle_segments(self.client.fetch_binary(track.url), track.ext)
+        return segments, track.language, track.source, info.get('duration')
+
     def run(self) -> dict[str, Any]:
-        fmt = self.config.output_format.lower()
-        fmt_labels = {
-            "txt":  "TXT  — plain text (default)",
-            "srt":  "SRT  — subtitles with timestamps",
-            "vtt":  "VTT  — WebVTT subtitles",
-            "json": "JSON — full segment data (start/end/text)",
-        }
-        quiet = self.config.quiet
-        if not quiet:
-            print("=================================================================")
-            print("  Single Transcription")
-            print("=================================================================")
-            print(f"  Input   : {self.config.input_path}")
-            print(f"  Model   : {self.config.model}")
-            print(f"  Device  : {self.config.device} ({self.config.compute_type})")
-            print(f"  Format  : {fmt_labels.get(fmt, fmt.upper())}")
-            print(f"  Output  : {self.config.output_dir}")
-            print("="*65)
-            print("  Formats: --format txt | srt | vtt | json")
-            print("=================================================================")
-            print()
-
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        is_url = self.config.input_path.startswith("http://") or self.config.input_path.startswith("https://")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            audio_path = None
-
+        started = time.perf_counter()
+        config = self.config
+        is_url = config.input_path.startswith(('http://', 'https://'))
+        if config.source == 'subtitles' and not is_url:
+            raise ValueError('--source subtitles requires a video URL')
+        if not is_url and not Path(config.input_path).is_file():
+            return {'success': False, 'error': 'File not found', 'input': config.input_path}
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        segments = None
+        subtitle_error = ''
+        download_s = 0.0
+        recognition_s = 0.0
+        actual_batch = 0
+        if is_url and config.source != 'asr':
             try:
+                segments, language, source, duration = self._try_subtitles()
+            except Exception as exc:
+                if config.source == 'subtitles':
+                    raise
+                subtitle_error = str(exc)
+                if not config.quiet:
+                    print(f'  [INFO] Subtitles unavailable ({exc}); using local ASR.', file=sys.stderr)
+        if segments is None:
+            with tempfile.TemporaryDirectory(prefix='transcriptex-') as temporary:
                 if is_url:
-                    if not quiet:
-                        print(f"  ↓ Downloading audio from URL...")
-                    start_dw = time.time()
-                    try:
-                        audio_path = self.client.download_audio(
-                            url=self.config.input_path,
-                            tmp_dir=Path(temp_dir),
-                        )
-                        dw_time = time.time() - start_dw
-                        if not quiet:
-                            print(f"    ✓ Downloaded in {dw_time:.1f}s")
-                    except Exception as e:
-                        if not quiet:
-                            print(f"    ✗ Download failed: {e}")
-                        return {"success": False, "error": str(e)}
+                    download_started = time.perf_counter()
+                    audio = self.client.download_audio(config.input_path, Path(temporary))
+                    download_s = time.perf_counter() - download_started
                 else:
-                    audio_path = Path(self.config.input_path)
-                    if not audio_path.exists():
-                        if not quiet:
-                            print(f"  ✗ Local file not found: {audio_path}")
-                        return {"success": False, "error": "File not found"}
-
-                if not quiet:
-                    print(f"  🎙 Transcribing...")
-                start_tr = time.time()
-                segments_gen, info = self.engine.transcribe(
-                    str(audio_path),
-                    beam_size=self.config.beam_size,
-                    language=self.config.language if self.config.language else None,
-                )
-
-                segments = list(segments_gen)
-                tr_time = time.time() - start_tr
-                if not quiet:
-                    print(f"    ✓ Transcribed in {tr_time:.1f}s (Detected language: {info.language})")
-
-            finally:
-                pass # Temp file cleans up automatically
-
-        # Save to file
-        base_name = "transcript"
-        if not is_url:
-            base_name = Path(self.config.input_path).stem
+                    audio = Path(config.input_path)
+                asr_started = time.perf_counter()
+                segments, info, actual_batch = self.engine.transcribe_file(str(audio),
+                    batch_size=config.batch_size, vad_filter=config.vad_filter,
+                    beam_size=config.beam_size, language=config.language or None)
+                recognition_s = time.perf_counter() - asr_started
+                language = info.language
+                duration = getattr(info, 'duration', None)
+                source = 'asr'
+        if config.output_stem:
+            base_name = config.output_stem
+        elif not is_url:
+            base_name = Path(config.input_path).stem
         else:
-            base_name = f"transcript_{int(time.time())}"
-
-        out_file = self.config.output_dir / f"{base_name}.{self.config.output_format.lower()}"
-
-        fmt = self.config.output_format.lower()
-        if fmt == "srt":
-            self._write_srt(segments, out_file)
-        elif fmt == "vtt":
-            self._write_vtt(segments, out_file)
-        elif fmt == "json":
-            self._write_json(segments, out_file)
-        else:
-            self._write_txt(segments, out_file)
-
-        if self.config.print_summary and not quiet:
-            print(f"  ✓ Saved to: {out_file}")
-
+            from transcriptex.url_utils import extract_video_id
+            video_id = extract_video_id(config.input_path)
+            base_name = 'transcript_' + (video_id or hashlib.sha256(config.input_path.encode()).hexdigest()[:12])
+        out_file = config.output_dir / f'{base_name}.{config.output_format.lower()}'
+        # Write in the destination filesystem and replace only after a complete export.
+        fd, temporary_name = tempfile.mkstemp(prefix='.' + base_name + '-', suffix='.tmp', dir=config.output_dir)
+        os.close(fd)
+        temporary_path = Path(temporary_name)
+        try:
+            writer = getattr(self, '_write_' + config.output_format.lower())
+            writer(segments, temporary_path)
+            os.replace(temporary_path, out_file)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        if config.print_summary and not config.quiet:
+            print(f'  Saved: {out_file} ({source}, {language}, {len(segments)} segments)')
         return {
-            "success": True,
-            "output_file": str(out_file),
-            "language": info.language,
-            "segments": len(segments),
-            "duration_seconds": getattr(info, "duration", None),
+            'success': True, 'input': config.input_path, 'output_file': str(out_file),
+            'language': language, 'source': source, 'segments': len(segments),
+            'duration_seconds': duration, 'batch_size': actual_batch,
+            'device': self.engine.device if source == 'asr' else None,
+            'timing': {'download_s': download_s, 'recognition_with_load_s': recognition_s,
+                       'total_s': time.perf_counter() - started},
+            'subtitle_fallback_reason': subtitle_error,
         }
 
-def run_transcribe_single(config: TranscribeSingleConfig) -> dict[str, Any]:
-    transcriber = SingleTranscriber(config)
-    return transcriber.run()
+
+def run_transcribe_single(config: TranscribeSingleConfig, engine: ASREngine | None = None) -> dict[str, Any]:
+    return SingleTranscriber(config, engine=engine).run()

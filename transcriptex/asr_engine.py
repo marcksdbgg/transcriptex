@@ -1,4 +1,5 @@
 import os
+import sys
 import warnings
 from typing import Any
 
@@ -24,6 +25,7 @@ class ASREngine:
         self.device = device
         self.compute_type = compute_type
         self.model = None
+        self.batched = None
 
     def _resolve_device_and_compute(self) -> None:
         """Resolve 'auto' device/compute_type to concrete values, detecting GPU availability."""
@@ -32,14 +34,17 @@ class ASREngine:
             return
 
         gpu_available = False
-        if self.device == "auto" or (self.compute_type == "auto" and self.device in ("auto", "cuda")):
-            from transcriptex.dependency_manager import ensure_torch
-            ensure_torch()
-            import torch
-            gpu_available = torch.cuda.is_available()
+        if self.device in ("auto", "cuda"):
+            from transcriptex.dependency_manager import cuda_available
+
+            gpu_available = cuda_available()
 
         if self.device == "auto":
             self.device = "cuda" if gpu_available else "cpu"
+        elif self.device == "cuda" and not gpu_available:
+            print("  [WARN] CUDA unavailable. Falling back to CPU (int8).", file=sys.stderr)
+            self.device = "cpu"
+            self.compute_type = "int8"
         if self.compute_type == "auto":
             self.compute_type = "float16" if self.device == "cuda" else "int8"
 
@@ -51,23 +56,19 @@ class ASREngine:
         ensure_faster_whisper()
         from faster_whisper import WhisperModel
 
-        # Resolve auto values first (this will install torch if needed)
+        # Resolve auto values using CTranslate2, the inference backend
         self._resolve_device_and_compute()
 
-        # If CUDA was explicitly requested but is not available, fall back gracefully
-        if self.device == "cuda":
-            import torch
-            if not torch.cuda.is_available():
-                print("  [WARN] CUDA unavailable. Falling back to CPU (int8).")
-                self.device = "cpu"
-                self.compute_type = "int8"
-
-        print(f"  [ASR] Loading faster-whisper ({self.model_size}) on {self.device} ({self.compute_type})...")
-        self.model = WhisperModel(
-            self.model_size,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
+        print(f"  [ASR] Loading faster-whisper ({self.model_size}) on {self.device} ({self.compute_type})...", file=sys.stderr)
+        try:
+            self.model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
+        except RuntimeError as exc:
+            # A visible GPU does not imply usable cuBLAS/cuDNN libraries.
+            if self.device != "cuda" or not any(x in str(exc).lower() for x in ("cuda", "cublas", "cudnn")):
+                raise
+            print(f"  [WARN] CUDA runtime failed: {exc}. Falling back to CPU (int8).", file=sys.stderr)
+            self.device, self.compute_type = "cpu", "int8"
+            self.model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
         return self.model
 
     def transcribe(self, audio, **kwargs) -> tuple[Any, Any]:
@@ -75,3 +76,33 @@ class ASREngine:
         if self.model is None:
             self.load()
         return self.model.transcribe(audio, **kwargs)
+
+    def transcribe_file(self, audio, *, batch_size: int = 0, vad_filter: bool = True, **kwargs):
+        """Materialize one file; reduce batch size on GPU OOM before writing output.
+
+        A zero batch size selects 8 on CUDA and sequential inference on CPU.
+        The same engine can process several inputs without loading weights again.
+        """
+        self.load()
+        size = batch_size or (8 if self.device == "cuda" else 1)
+        if not vad_filter:
+            size = 1
+        if size > 1 and self.batched is None:
+            from faster_whisper import BatchedInferencePipeline
+            self.batched = BatchedInferencePipeline(model=self.model)
+        while True:
+            try:
+                if size > 1:
+                    # The batched decoder stores alignment state between calls.
+                    self.batched.last_speech_timestamp = 0.0
+                    segments, info = self.batched.transcribe(audio, batch_size=size, vad_filter=True,
+                        vad_parameters={"min_silence_duration_ms": 500}, **kwargs)
+                else:
+                    segments, info = self.model.transcribe(audio, vad_filter=vad_filter,
+                        vad_parameters={"min_silence_duration_ms": 500}, **kwargs)
+                return list(segments), info, size
+            except RuntimeError as exc:
+                if self.device != "cuda" or size <= 1 or "out of memory" not in str(exc).lower():
+                    raise
+                size = max(1, size // 2)
+                print(f"  [WARN] GPU memory exhausted; retrying with batch size {size}.", file=sys.stderr)

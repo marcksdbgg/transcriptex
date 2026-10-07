@@ -21,6 +21,8 @@ both humans and AI agents:
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout, nullcontext
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -84,7 +86,7 @@ COOKIES_HELP = (
 
 QUIET_HELP = (
     "Suppress the human-readable summary printed at the end. "
-    "Errors and progress output are still shown unless combined with --json."
+    "Diagnostics go to stderr with --json; stdout contains only the JSON report."
 )
 
 JSON_HELP = (
@@ -175,6 +177,7 @@ EPILOG_SEARCH = (
 EPILOG_ASR = (
     "Examples:\n"
     "  transcriptex asr \"output/My Channel\" --device cuda --language es\n"
+    "  transcriptex asr \"output/My Channel\" --download-workers 3   # prefetch while GPU works\n"
     "  transcriptex asr \"output/My Channel\" --batch-size 16        # faster on GPU\n"
     "  transcriptex asr \"output/My Channel\" --include-failed --cookies cookies.txt\n"
     "\n"
@@ -200,8 +203,9 @@ EPILOG_TRANSCRIBE = (
     "  transcriptex transcribe \"https://www.youtube.com/watch?v=abc\" --cookies cookies.txt\n"
     "\n"
     "Exit codes:\n"
-    "  0  transcript written successfully\n"
-    "  1  fatal error (download failed, transcription failed, etc.)"
+    "  0  all requested transcripts written successfully\n"
+    "  1  fatal error for a single input\n"
+    "  2  one or more inputs failed in a multi-input run"
 )
 
 EPILOG_REALTIME = (
@@ -212,7 +216,9 @@ EPILOG_REALTIME = (
     "  transcriptex realtime --process zen.exe --language en\n"
     "\n"
     "Notes:\n"
-    "  - Windows-only (requires pyaudiowpatch and numpy).\n"
+    "  - Linux: PulseAudio/PipeWire (parec); Windows: WASAPI.\n"
+    "  - Linux requires --output; partial previews are not confirmed text.\n"
+    "  - Linux finalizes a full-recording transcript on Ctrl+C by default.\n"
     "  - Press Ctrl+C to stop."
 )
 
@@ -563,6 +569,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Backoff retries before aborting the run on persistent rate limits (default: 3).",
     )
     asr_parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=4,
+        help=(
+            "Parallel download threads prefetching audio into a buffer queue "
+            "while the GPU transcribes (default: 4). Raise to 6 if GPU still "
+            "has idle gaps; lower to 2 if YouTube rate-limits."
+        ),
+    )
+    asr_parser.add_argument(
         "--retries",
         type=int,
         default=2,
@@ -588,19 +604,19 @@ def build_parser() -> argparse.ArgumentParser:
     # --- transcribe --------------------------------------------------------
     transcribe_parser = subparsers.add_parser(
         TRANSCRIBE_COMMAND,
-        help="Transcribe a single local file or YouTube URL with Whisper.",
+        help="Transcribe media files or video URLs (subtitles first, local ASR fallback).",
         description=(
-            "Transcribe any local audio/video file (MP4, MKV, MP3, WAV, etc.) or a "
-            "YouTube URL using local faster-whisper. For local files, the file is "
-            "read directly — no download. For URLs, audio is downloaded temporarily "
+            "Transcribe local audio/video files (MP4, MKV, MP3, WAV, etc.) or "
+            "video URLs. URLs prefer existing subtitles by default; otherwise local "
+            "faster-whisper performs ASR. Files are read directly. Audio is downloaded "
             "and deleted after transcription."
         ),
         epilog=EPILOG_TRANSCRIBE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     transcribe_parser.add_argument(
-        "input_path",
-        help="Local file path or YouTube URL (http(s)://...).",
+        "input_path", nargs="+",
+        help="One or more local media files or video URLs; reuses one ASR model.",
     )
     transcribe_parser.add_argument(
         "-o", "--output",
@@ -650,8 +666,8 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe_parser.add_argument(
         "--beam-size",
         type=int,
-        default=5,
-        help="Beam search size (default: 5). Higher = better quality, slower.",
+        default=1,
+        help="Beam search size (default: 1). Use 5 to explore more candidates, at greater cost.",
     )
     transcribe_parser.add_argument(
         "--verbose",
@@ -663,35 +679,43 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=COOKIES_HELP + " (only used for YouTube URL input)",
     )
+    transcribe_parser.add_argument("--source", choices=["auto", "subtitles", "asr"], default="auto",
+        help="URL source: auto prefers existing subtitles, subtitles never runs ASR, asr forces recognition.")
+    transcribe_parser.add_argument("--lang-priority", default="",
+        help="Subtitle language preferences, comma-separated (default: --language or es,en).")
+    transcribe_parser.add_argument("--batch-size", type=int, default=0,
+        help="ASR batch size: 0 selects 8 on CUDA / 1 on CPU; 1 disables batching. Reduced on GPU OOM.")
+    transcribe_parser.add_argument("--no-vad", action="store_true",
+        help="Disable silence filtering and batching for file ASR.")
     _add_report_flags(transcribe_parser)
 
     # --- realtime ----------------------------------------------------------
     realtime_parser = subparsers.add_parser(
         REALTIME_COMMAND,
-        help="Live transcription of system audio (Windows WASAPI loopback).",
+        help="Live system/microphone transcription on Linux or Windows.",
         description=(
             "Capture audio playing on your PC (browsers, media players, meetings, "
             "etc.) via WASAPI Loopback and transcribe it live to the console. "
-            "Windows-only — requires pyaudiowpatch and numpy."
+            "Linux uses PulseAudio/PipeWire (parec); Windows uses pyaudiowpatch."
         ),
         epilog=EPILOG_REALTIME,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     realtime_parser.add_argument(
         "--model",
-        default="medium",
-        help="Whisper model name (default: medium — smaller = lower latency).",
+        default="large-v3-turbo",
+        help="Whisper model name (default: large-v3-turbo).",
     )
     realtime_parser.add_argument(
         "--device",
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="Inference device (default: cuda).",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Inference device (default: auto — CUDA when available).",
     )
     realtime_parser.add_argument(
         "--compute-type",
-        default="float16",
-        help="Model quantization (default: float16).",
+        default="auto",
+        help="Model quantization (default: auto — float16 on CUDA / int8 on CPU).",
     )
     realtime_parser.add_argument(
         "--language",
@@ -708,7 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--chunk-duration",
         type=float,
         default=3.0,
-        help="Audio buffer window duration in seconds (default: 3.0).",
+        help="Linux partial-preview interval / Windows buffer duration (default: 3.0 s).",
     )
     realtime_parser.add_argument(
         "--process",
@@ -721,7 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     realtime_parser.add_argument(
         "--list-devices",
         action="store_true",
-        help="List available WASAPI loopback audio devices and exit.",
+        help="List PulseAudio/PipeWire sources on Linux or WASAPI devices on Windows.",
     )
     realtime_parser.add_argument(
         "--device-index",
@@ -729,6 +753,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=-1,
         help="Select audio device by index (use --list-devices to see available devices).",
     )
+
+    realtime_parser.add_argument("--source", default="@DEFAULT_MONITOR@", help="Linux PulseAudio source name.")
+    realtime_parser.add_argument("--microphone", default="", help="Optional Linux microphone source.")
+    realtime_parser.add_argument("--monitor-stream", type=int, default=-1, help="Linux sink-input index to isolate application audio.")
+    realtime_parser.add_argument("--output", default="", help="Linux UTF-8 TXT output, appended and flushed continuously.")
+
+    realtime_parser.add_argument("--max-segment-duration", type=float, default=15.0,
+        help="Linux maximum speech segment before an overlapping cut (default: 15 s).")
+    realtime_parser.add_argument("--silence-duration", type=float, default=0.6,
+        help="Linux pause needed to confirm a segment (default: 0.6 s).")
+    realtime_parser.add_argument("--silence-threshold", type=float, default=0.002,
+        help="Linux RMS threshold for pause detection (default: 0.002).")
+    realtime_parser.add_argument("--overlap-duration", type=float, default=1.0,
+        help="Linux audio retained across forced cuts (default: 1 s).")
+    realtime_parser.add_argument("--no-preview", action="store_true",
+        help="Linux: only print confirmed segments, reducing GPU work.")
+    realtime_parser.add_argument("--no-finalize", action="store_true",
+        help="Linux: skip full-recording transcription on stop; temporary audio is not retained.")
+    realtime_parser.add_argument("--record-audio", action="store_true",
+        help="Linux: retain per-source WAV files beside the TXT (otherwise temporary audio is removed).")
+    realtime_parser.add_argument("--queue-seconds", type=float, default=30.0,
+        help="Linux maximum queued audio per source; fail explicitly on overflow (default: 30 s).")
 
     # --- scan --------------------------------------------------------------
     scan_parser = subparsers.add_parser(
@@ -833,10 +879,11 @@ def _resolve_cookies(explicit: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    if sys.stdout.encoding.lower() != 'utf-8':
+    # Help, subtitle retrieval and searches must not initialize/install GPU runtimes.
+    if (getattr(sys.stdout, 'encoding', None) or '').lower() != 'utf-8':
         try:
             sys.stdout.reconfigure(encoding='utf-8')
-        except AttributeError:
+        except (AttributeError, ValueError):
             pass
 
     argv = list(argv if argv is not None else sys.argv[1:])
@@ -846,14 +893,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     command = args.command or RUN_COMMAND
 
-    handler = _DISPATCH.get(command)
-    if handler is None:
-        return _run_export(args)
-    try:
-        return handler(args)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.", file=sys.stderr)
-        return 130
+    handler = _DISPATCH.get(command, _run_export)
+    json_mode = bool(getattr(args, 'json', False))
+    args._report_stream = sys.stdout
+    # Capture Python diagnostics from nested modules without buffering channel runs.
+    # The final JSON is explicitly written to the original stdout.
+    with redirect_stdout(sys.stderr) if json_mode else nullcontext():
+        try:
+            return handler(args)
+        except KeyboardInterrupt as exc:
+            print("\nInterrupted by user.", file=sys.stderr)
+            return _emit_error_and_return(args, exc, command=command, exit_code=130)
+        except Exception as exc:
+            print(f"Fatal error: {exc}", file=sys.stderr)
+            return _emit_error_and_return(args, exc, command=command)
 
 
 _DISPATCH: dict[str, Callable[[argparse.Namespace], int]] = {}
@@ -995,6 +1048,7 @@ def _run_asr(args: argparse.Namespace) -> int:
         rate_limit_wait_seconds=max(10.0, float(getattr(args, "rate_limit_wait", 60.0))),
         max_rate_limit_waits=max(1, int(getattr(args, "max_rate_limit_waits", 3))),
         yt_sleep_interval=0.0,
+        download_workers=max(1, int(getattr(args, "download_workers", 4))),
     )
     try:
         report = run_asr(config)
@@ -1017,56 +1071,49 @@ def _run_asr(args: argparse.Namespace) -> int:
 
 def _run_transcribe_single(args: argparse.Namespace) -> int:
     from transcriptex.transcribe_single import TranscribeSingleConfig, run_transcribe_single
+    from transcriptex.asr_engine import ASREngine
 
-    input_path = args.input_path
-    is_url = input_path.startswith("http://") or input_path.startswith("https://")
-
-    if args.output:
-        output_dir = Path(args.output).resolve()
-    elif not is_url:
-        output_dir = Path(input_path).resolve().parent
+    inputs = args.input_path if isinstance(args.input_path, list) else [args.input_path]
+    inputs = list(dict.fromkeys(inputs))
+    if args.batch_size < 0:
+        raise ValueError('--batch-size must be nonnegative')
+    engine = ASREngine(args.model, args.device, args.compute_type)
+    cookies = _resolve_cookies(str(getattr(args, "cookies", "") or ""))
+    results = []
+    used_outputs = set()
+    for input_path in inputs:
+        is_url = input_path.startswith(('http://', 'https://'))
+        output_dir = Path(args.output).resolve() if args.output else (Path.cwd() if is_url else Path(input_path).resolve().parent)
+        stem = ''
+        if not is_url:
+            stem = Path(input_path).stem
+            if (output_dir, stem) in used_outputs:
+                stem += '-' + hashlib.sha256(str(Path(input_path).resolve()).encode()).hexdigest()[:8]
+            used_outputs.add((output_dir, stem))
+        config = TranscribeSingleConfig(
+            input_path=input_path, output_dir=output_dir, output_format=args.format,
+            model=args.model, device=args.device, compute_type=args.compute_type,
+            language=args.language, beam_size=max(1, int(args.beam_size)),
+            verbose=bool(args.verbose), cookies=cookies,
+            quiet=bool(getattr(args, 'quiet', False)), print_summary=_should_print_summary(args),
+            source=args.source, lang_priority=args.lang_priority, batch_size=args.batch_size,
+            vad_filter=not args.no_vad, output_stem=stem,
+        )
+        try:
+            report = run_transcribe_single(config, engine=engine)
+        except Exception as exc:
+            print(f"Failed: {input_path}: {exc}", file=sys.stderr)
+            report = {'success': False, 'input': input_path, 'error': str(exc), 'error_type': type(exc).__name__}
+        results.append(report)
+    failures = sum(not r.get('success') for r in results)
+    if len(results) == 1:
+        report = results[0]
+        exit_code = EXIT_FATAL if failures else EXIT_OK
     else:
-        output_dir = Path(".").resolve()
-
-    device = args.device
-    compute_type = args.compute_type
-    if device == "auto" or compute_type == "auto":
-        from transcriptex.dependency_manager import ensure_torch
-        ensure_torch()
-        import torch
-        gpu_available = torch.cuda.is_available()
-        if device == "auto":
-            device = "cuda" if gpu_available else "cpu"
-        if compute_type == "auto":
-            compute_type = "float16" if (device == "cuda") else "int8"
-
-    config = TranscribeSingleConfig(
-        input_path=input_path,
-        output_dir=output_dir,
-        output_format=args.format,
-        model=args.model,
-        device=device,
-        compute_type=compute_type,
-        language=args.language,
-        beam_size=max(1, int(args.beam_size)),
-        verbose=bool(args.verbose),
-        cookies=_resolve_cookies(str(getattr(args, "cookies", "") or "")),
-        quiet=bool(getattr(args, "quiet", False)),
-        print_summary=_should_print_summary(args),
-    )
-    try:
-        report = run_transcribe_single(config)
-    except Exception as exc:
-        print(f"Fatal error: {exc}", file=sys.stderr)
-        return _emit_error_and_return(args, exc, command=TRANSCRIBE_COMMAND)
-
-    return _emit_report(
-        args,
-        command=TRANSCRIBE_COMMAND,
-        report=report,
-        human_formatter=None,  # transcribe prints its own summary
-        exit_code=EXIT_OK if report.get("success") else EXIT_FATAL,
-    )
+        report = {'results': results, 'processed_ok': len(results)-failures, 'failed': failures}
+        exit_code = EXIT_WARNINGS if failures else EXIT_OK
+    return _emit_report(args, command=TRANSCRIBE_COMMAND, report=report,
+        human_formatter=None, exit_code=exit_code)
 
 
 def _run_realtime(args: argparse.Namespace) -> int:
@@ -1078,10 +1125,16 @@ def _run_realtime(args: argparse.Namespace) -> int:
         compute_type=args.compute_type,
         language=args.language,
         beam_size=max(1, int(args.beam_size)),
-        chunk_duration=max(0.5, float(args.chunk_duration)),
+        chunk_duration=float(args.chunk_duration),
         process=args.process,
         list_devices=args.list_devices,
         device_index=args.device_index,
+        source=args.source, microphone=args.microphone,
+        monitor_stream=args.monitor_stream, output=args.output,
+        max_segment_duration=args.max_segment_duration, silence_duration=args.silence_duration,
+        silence_threshold=args.silence_threshold, overlap_duration=args.overlap_duration,
+        preview=not args.no_preview, finalize=not args.no_finalize,
+        record_audio=args.record_audio, queue_seconds=args.queue_seconds,
     )
     try:
         report = run_realtime(config)
@@ -1192,7 +1245,7 @@ def _emit_report(
             "exit_code": exit_code,
             "report": report,
         }
-        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str), file=getattr(args, "_report_stream", sys.stdout))
         return exit_code
 
     if not _should_print_summary(args):
@@ -1207,18 +1260,19 @@ def _emit_error_and_return(
     args: argparse.Namespace,
     exc: BaseException,
     command: str,
+    exit_code: int = EXIT_FATAL,
 ) -> int:
     """Emit a JSON error report if --json, otherwise return the fatal exit code."""
     if bool(getattr(args, "json", False)):
         payload = {
             "command": command,
             "success": False,
-            "exit_code": EXIT_FATAL,
+            "exit_code": exit_code,
             "error": str(exc),
             "error_type": type(exc).__name__,
         }
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return EXIT_FATAL
+        print(json.dumps(payload, indent=2, ensure_ascii=False), file=getattr(args, "_report_stream", sys.stdout))
+    return exit_code
 
 
 def _print_run_summary(report: dict[str, Any]) -> None:
